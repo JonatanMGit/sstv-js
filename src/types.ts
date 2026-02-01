@@ -3,17 +3,22 @@
  */
 
 /**
- * Color format enumeration
+ * Color format enumeration for SSTV modes
  */
 export enum ColorFormat {
+    /** Standard RGB color */
     RGB = 'RGB',
-    GBR = 'GBR',  // Green-Blue-Red (Martin, Scottie)
-    YCrCb = 'YCrCb', // YUV color space (Robot, PD)
+    /** Green-Blue-Red order (Martin, Scottie modes) */
+    GBR = 'GBR',
+    /** YUV color space (Robot, PD modes) */
+    YCrCb = 'YCrCb',
+    /** Single-channel grayscale (Robot 8BW) */
     Grayscale = 'Grayscale'
 }
 
 /**
- * Chroma subsampling types
+ * Chroma subsampling types for YCrCb modes
+ * @see https://en.wikipedia.org/wiki/Chroma_subsampling
  */
 export enum ChromaSubsampling {
     /** Full chroma (4:4:4 equivalent for RGB modes) */
@@ -26,56 +31,58 @@ export enum ChromaSubsampling {
 
 /**
  * SSTV Mode definition interface
+ * 
+ * All timing values are in seconds unless otherwise noted.
  */
 export interface SSTVMode {
-    /** Mode ID (VIS code) */
-    id: number;
+    /** Mode ID (VIS code, 0-127) */
+    readonly id: number;
     /** Mode name (e.g., "Martin M1") */
-    name: string;
+    readonly name: string;
     /** Color format */
-    colorFormat: ColorFormat;
+    readonly colorFormat: ColorFormat;
     /** Chroma subsampling */
-    chromaSubsampling: ChromaSubsampling;
+    readonly chromaSubsampling: ChromaSubsampling;
     /** Image width in pixels */
-    width: number;
+    readonly width: number;
     /** Image height in pixels */
-    height: number;
+    readonly height: number;
 
     /** Sync pulse duration in seconds */
-    syncPulse: number;
+    readonly syncPulse: number;
     /** Sync porch duration in seconds */
-    syncPorch: number;
+    readonly syncPorch: number;
 
-    /** Number of color channels/components */
-    channelCount: number;
+    /** Number of color channels/components (1-4) */
+    readonly channelCount: number;
     /** Channel order (e.g., [0, 1, 2] for RGB or [1, 2, 0] for GBR) */
-    channelOrder: number[];
+    readonly channelOrder: readonly number[];
     /** Scan time per channel in seconds */
-    scanTimes: number[];
+    readonly scanTimes: readonly number[];
     /** Separator pulse durations in seconds */
-    separatorPulses: number[];
+    readonly separatorPulses: readonly number[];
 
     /** Total line time in seconds */
-    lineTime: number;
+    readonly lineTime: number;
     /** Whether the first line has a special start sync */
-    hasStartSync: boolean;
-    /** Channel index that contains sync (for Scottie modes) */
-    syncChannel?: number;
+    readonly hasStartSync: boolean;
+    /** Channel index that contains sync (for Scottie modes where sync is mid-line) */
+    readonly syncChannel?: number;
     /** Window factor for pixel sampling (window size = pixelTime * windowFactor) */
-    windowFactor: number;
+    readonly windowFactor: number;
 
     /**
      * Calculate the timing offset for a specific component
-     * @param line Line number (0-indexed)
-     * @param channel Channel index
-     * @returns Offset in seconds from line start
+     * @param line - Line number (0-indexed)
+     * @param channel - Channel index
+     * @returns Offset in seconds from line start (or sync pulse for mid-sync modes)
      */
     getChannelOffset(line: number, channel: number): number;
 
     /**
      * Get the scan time for a specific channel and line
-     * @param line Line number (0-indexed)
-     * @param channel Channel index
+     * @param line - Line number (0-indexed)
+     * @param channel - Channel index
      * @returns Scan duration in seconds
      */
     getScanTime(line: number, channel: number): number;
@@ -83,25 +90,26 @@ export interface SSTVMode {
 
 /**
  * Image data structure - 3D array [line][channel][pixel]
+ * Each pixel value is 0-255 representing brightness or color component
  */
-export type ImageData = number[][][];
+export type ImageData = readonly (readonly (readonly number[])[])[];
 
 /**
- * Decoded SSTV image
+ * Decoded SSTV image result
  */
 export interface DecodedImage {
     /** Mode used for decoding */
-    mode: SSTVMode;
-    /** Image data as 3D array [line][channel][pixel] */
-    data: ImageData;
-    /** Image width */
-    width: number;
-    /** Image height */
-    height: number;
-    /** Lines successfully decoded */
-    linesDecoded: number;
+    readonly mode: SSTVMode;
+    /** Image data as 3D array [line][channel][pixel], values 0-255 */
+    readonly data: ImageData;
+    /** Image width in pixels */
+    readonly width: number;
+    /** Image height in pixels */
+    readonly height: number;
+    /** Lines successfully decoded (may be less than height for incomplete signals) */
+    readonly linesDecoded: number;
     /** Slant correction factor applied (1.0 = no correction) */
-    slantCorrection: number;
+    readonly slantCorrection: number;
 }
 
 /**
@@ -183,10 +191,10 @@ export interface EncoderOptions {
  * Audio samples with metadata
  */
 export interface AudioBuffer {
-    /** Audio samples */
-    samples: Float32Array;
-    /** Sample rate */
-    sampleRate: number;
-    /** Number of channels (mono = 1, stereo = 2) */
-    channels: number;
+    /** Audio samples (mono, normalized to -1.0 to 1.0) */
+    readonly samples: Float32Array;
+    /** Sample rate in Hz */
+    readonly sampleRate: number;
+    /** Number of channels (mono = 1, stereo = 2) - samples array is always mono */
+    readonly channels: number;
 }

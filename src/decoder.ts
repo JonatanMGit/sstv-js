@@ -20,10 +20,10 @@ import { FFTPeakFinder } from './utils/fft-helper';
  * Internal image data structure during decoding
  */
 interface InternalImageData {
-    mode: SSTVMode;
-    width: number;
-    height: number;
-    channels: Uint8Array[];
+    readonly mode: SSTVMode;
+    readonly width: number;
+    readonly height: number;
+    readonly channels: Uint8Array[];
     linesDecoded: number;
     slantCorrection: number;
 }
@@ -32,23 +32,22 @@ interface InternalImageData {
  * Main streaming SSTV decoder class using FM demodulation
  */
 export class SSTVDecoder extends EventEmitter {
-    private samples: Float32Array;
-    private sampleRate: number;
-    private demodulator: Demodulator;
+    private readonly samples: Float32Array;
+    private readonly sampleRate: number;
+    private readonly demodulator: Demodulator;
+    private readonly options: DecoderOptions;
+    private readonly fftPeakFinder: FFTPeakFinder;
+
     private mode: SSTVMode | null = null;
-    private options: DecoderOptions;
 
     // Demodulated frequency buffer (for sync detection)
-    private scanLineBuffer: Float32Array;
+    private readonly scanLineBuffer: Float32Array;
     private currentSample: number = 0;
 
-    // FFT peak finder for pixel decoding
-    private fftPeakFinder: FFTPeakFinder;
-
-    // Mode detection arrays
-    private syncPulse5msModes: SSTVMode[] = [];
-    private syncPulse9msModes: SSTVMode[] = [];
-    private syncPulse20msModes: SSTVMode[] = [];
+    // Mode detection arrays (readonly after initialization)
+    private readonly syncPulse5msModes: SSTVMode[];
+    private readonly syncPulse9msModes: SSTVMode[];
+    private readonly syncPulse20msModes: SSTVMode[];
 
     // Sync tracking
     private lastSyncPulseIndex: number = 0;
@@ -56,25 +55,22 @@ export class SSTVDecoder extends EventEmitter {
     private lastFrequencyOffset: number = 0;
 
     // Recent sync pulses and scan lines for mode detection
-    private last5msSyncPulses: number[] = [];
-    private last9msSyncPulses: number[] = [];
-    private last20msSyncPulses: number[] = [];
-    private last5msScanLines: number[] = [];
-    private last9msScanLines: number[] = [];
-    private last20msScanLines: number[] = [];
+    private readonly last5msSyncPulses: number[];
+    private readonly last9msSyncPulses: number[];
+    private readonly last20msSyncPulses: number[];
+    private readonly last5msScanLines: number[];
+    private readonly last9msScanLines: number[];
+    private readonly last20msScanLines: number[];
 
     // VIS code detection
     private leaderBreakIndex: number = 0;
-    private visCandidates: Array<{ index: number, freqOffset: number }> = [];
+    private visCandidates: Array<{ index: number; freqOffset: number }> = [];
 
     // Detected sync pulses for image reconstruction
     private detectedSyncPulses: number[] = [];
 
-    // Constants
-    private readonly scanLineMaxSeconds = 7;
-    private readonly scanLineMinSeconds = 0.05;
-    private readonly scanLineToleranceSeconds = 0.001;
-    private readonly syncPulseToleranceSeconds = 0.03;
+    // Cached constants
+    private readonly scanLineToleranceSeconds = 0.001 as const;
 
     constructor(samples: Float32Array, options: DecoderOptions) {
         super();
@@ -94,9 +90,12 @@ export class SSTVDecoder extends EventEmitter {
         this.fftPeakFinder = new FFTPeakFinder(4096, this.sampleRate);
 
         // Initialize mode lists by sync pulse width
-        this.initializeModes();
+        const { pulse5ms, pulse9ms, pulse20ms } = this.categorizeModesBySyncPulse();
+        this.syncPulse5msModes = pulse5ms;
+        this.syncPulse9msModes = pulse9ms;
+        this.syncPulse20msModes = pulse20ms;
 
-        // Initialize sync tracking arrays
+        // Initialize sync tracking arrays with fixed size
         const syncPulseCount = 5;
         const scanLineCount = 4;
         this.last5msSyncPulses = new Array(syncPulseCount).fill(0);
@@ -108,22 +107,32 @@ export class SSTVDecoder extends EventEmitter {
     }
 
     /**
-     * Initialize mode lists categorized by sync pulse width
+     * Categorize modes by sync pulse width
      */
-    private initializeModes(): void {
+    private categorizeModesBySyncPulse(): {
+        pulse5ms: SSTVMode[];
+        pulse9ms: SSTVMode[];
+        pulse20ms: SSTVMode[];
+    } {
+        const pulse5ms: SSTVMode[] = [];
+        const pulse9ms: SSTVMode[] = [];
+        const pulse20ms: SSTVMode[] = [];
+
         const allModes = getAllModes();
 
         for (const mode of allModes) {
             const syncMs = mode.syncPulse * 1000;
 
             if (Math.abs(syncMs - 5) < 1) {
-                this.syncPulse5msModes.push(mode);
+                pulse5ms.push(mode);
             } else if (Math.abs(syncMs - 9) < 1) {
-                this.syncPulse9msModes.push(mode);
+                pulse9ms.push(mode);
             } else if (Math.abs(syncMs - 20) < 2) {
-                this.syncPulse20msModes.push(mode);
+                pulse20ms.push(mode);
             }
         }
+
+        return { pulse5ms, pulse9ms, pulse20ms };
     }
 
     /**
@@ -148,7 +157,6 @@ export class SSTVDecoder extends EventEmitter {
                     this.scanLineBuffer[this.currentSample++] = output[i];
 
                     // Never shift buffer - keep all samples for decoding
-                    // (Memory usage is acceptable for typical SSTV signals)
                 }
 
                 // Check for sync pulse
@@ -698,53 +706,62 @@ export class SSTVDecoder extends EventEmitter {
 
 /**
  * Convert decoded SSTV image to RGB byte array
+ * 
+ * Optimized to minimize per-pixel calculations:
+ * - Chroma interpolation is computed once per line for Robot 36
+ * - Color conversion uses direct index calculation
  */
 export function imageDataToRGB(decoded: DecodedImage): Uint8Array {
     const { mode, data, width, height } = decoded;
     const rgb = new Uint8Array(width * height * 3);
+    const colorFormat = mode.colorFormat;
+    const channelCount = mode.channelCount;
 
     for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            const idx = (y * width + x) * 3;
+        const lineOffset = y * width * 3;
+        const lineData = data[y];
 
-            if (mode.colorFormat === ColorFormat.RGB) {
-                rgb[idx] = data[y][0][x];
-                rgb[idx + 1] = data[y][1][x];
-                rgb[idx + 2] = data[y][2][x];
-            } else if (mode.colorFormat === ColorFormat.YCrCb) {
-                const yVal = data[y][0][x];
+        if (colorFormat === ColorFormat.RGB) {
+            const ch0 = lineData[0];
+            const ch1 = lineData[1];
+            const ch2 = lineData[2];
+            for (let x = 0; x < width; x++) {
+                const idx = lineOffset + x * 3;
+                rgb[idx] = ch0[x];
+                rgb[idx + 1] = ch1[x];
+                rgb[idx + 2] = ch2[x];
+            }
+        } else if (colorFormat === ColorFormat.YCrCb) {
+            const yChannel = lineData[0];
 
-                if (mode.channelCount === 2) {
-                    // Robot 36 (Even=V, Odd=U)
-                    const chroma = interpolateChroma(y, height, data, width);
-                    // Pass correct order: y, u, v
-                    // InterpolateChroma returns v (red diff) and u (blue diff)
-                    const [r, g, b] = yuvToRgb(yVal, chroma.u[x], chroma.v[x]);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
-                } else if (mode.channelCount === 3) {
-                    // Robot 72 - 4:2:2
-                    // Channels are: 0=Y, 1=V(Cr), 2=U(Cb)
-                    // yuvToRgb expects (y, u, v) order
-                    const vVal = data[y][1][x];  // V (Cr)
-                    const uVal = data[y][2][x];  // U (Cb)
-                    const [r, g, b] = yuvToRgb(yVal, uVal, vVal);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
-                } else if (mode.channelCount === 4) {
-                    // PD modes - channels are: 0=Y, 1=V(Cr), 2=U(Cb)
-                    // Function signature is (y, u, v)
-                    const vVal = data[y][1][x];  // V = Cr
-                    const uVal = data[y][2][x];  // U = Cb
-                    const [r, g, b] = yuvToRgb(yVal, uVal, vVal);
+            if (channelCount === 2) {
+                // Robot 36: Compute chroma once per line (not per pixel!)
+                const chroma = interpolateChroma(y, height, data, width);
+                for (let x = 0; x < width; x++) {
+                    const idx = lineOffset + x * 3;
+                    const [r, g, b] = yuvToRgb(yChannel[x], chroma.u[x], chroma.v[x]);
                     rgb[idx] = r;
                     rgb[idx + 1] = g;
                     rgb[idx + 2] = b;
                 }
-            } else if (mode.colorFormat === ColorFormat.Grayscale) {
-                const gray = data[y][0][x];
+            } else {
+                // Robot 72 (3 channels) and PD modes (4 channels)
+                // Both have: 0=Y, 1=V(Cr), 2=U(Cb)
+                const vChannel = lineData[1];
+                const uChannel = lineData[2];
+                for (let x = 0; x < width; x++) {
+                    const idx = lineOffset + x * 3;
+                    const [r, g, b] = yuvToRgb(yChannel[x], uChannel[x], vChannel[x]);
+                    rgb[idx] = r;
+                    rgb[idx + 1] = g;
+                    rgb[idx + 2] = b;
+                }
+            }
+        } else if (colorFormat === ColorFormat.Grayscale) {
+            const grayChannel = lineData[0];
+            for (let x = 0; x < width; x++) {
+                const idx = lineOffset + x * 3;
+                const gray = grayChannel[x];
                 rgb[idx] = gray;
                 rgb[idx + 1] = gray;
                 rgb[idx + 2] = gray;

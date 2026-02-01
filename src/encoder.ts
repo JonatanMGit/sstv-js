@@ -10,48 +10,102 @@ import {
 import { getModeByVIS } from './modes';
 import { pixelToFrequency } from './constants';
 import * as CONST from './constants';
-import { rgbToYUV, rgbToYCrCb } from './utils/colorspace';
+import { rgbToYUV } from './utils/colorspace';
+
+/** Two times PI for phase calculations */
+const TWO_PI = 2 * Math.PI;
 
 /**
- * Generate a sine wave tone with phase continuity
- * @param frequency Frequency in Hz
- * @param duration Duration in seconds
- * @param sampleRate Sample rate
- * @param startPhase Starting phase in radians
- * @returns Object with buffer and ending phase
+ * Optimized sine wave generator that writes directly to an output buffer
+ * Maintains phase continuity between calls
  */
-function generateTone(
-    frequency: number,
-    duration: number,
-    sampleRate: number,
-    startPhase: number = 0
-): { buffer: Float32Array; endPhase: number } {
-    const samples = Math.floor(duration * sampleRate);
-    const buffer = new Float32Array(samples);
-    const phaseIncrement = (2 * Math.PI * frequency) / sampleRate;
+class PhaseAccumulator {
+    private phase: number = 0;
+    private readonly sampleRate: number;
+    private readonly twoPiOverSampleRate: number;
 
-    let phase = startPhase;
-    for (let i = 0; i < samples; i++) {
-        buffer[i] = Math.sin(phase);
-        phase += phaseIncrement;
+    constructor(sampleRate: number) {
+        this.sampleRate = sampleRate;
+        this.twoPiOverSampleRate = TWO_PI / sampleRate;
     }
 
-    // Normalize phase to [0, 2π)
-    phase = phase % (2 * Math.PI);
-    if (phase < 0) phase += 2 * Math.PI;
+    /**
+     * Generate a sine wave tone directly into the buffer at the specified offset
+     * @param buffer Target buffer
+     * @param offset Starting offset in buffer
+     * @param frequency Frequency in Hz
+     * @param samples Number of samples to generate
+     * @returns New offset after writing
+     */
+    generateTone(buffer: Float32Array, offset: number, frequency: number, samples: number): number {
+        const phaseIncrement = frequency * this.twoPiOverSampleRate;
+        let phase = this.phase;
 
-    return { buffer, endPhase: phase };
+        for (let i = 0; i < samples; i++) {
+            buffer[offset + i] = Math.sin(phase);
+            phase += phaseIncrement;
+        }
+
+        // Normalize phase to prevent floating point drift
+        this.phase = phase % TWO_PI;
+        if (this.phase < 0) this.phase += TWO_PI;
+
+        return offset + samples;
+    }
+
+    /**
+     * Generate pixel data for a scanline directly into the buffer
+     * @param buffer Target buffer
+     * @param offset Starting offset
+     * @param pixelData Array of pixel values (0-255)
+     * @param scanTime Total scan time in seconds
+     * @returns New offset after writing
+     */
+    generatePixelLine(buffer: Float32Array, offset: number, pixelData: number[], scanTime: number): number {
+        const width = pixelData.length;
+        const totalSamples = Math.floor(scanTime * this.sampleRate);
+        const samplesPerPixel = totalSamples / width;
+
+        for (let pixel = 0; pixel < width; pixel++) {
+            const freq = pixelToFrequency(pixelData[pixel]);
+            const phaseIncrement = freq * this.twoPiOverSampleRate;
+
+            const startSample = Math.floor(pixel * samplesPerPixel);
+            const endSample = Math.min(Math.floor((pixel + 1) * samplesPerPixel), totalSamples);
+
+            for (let s = startSample; s < endSample; s++) {
+                buffer[offset + s] = Math.sin(this.phase);
+                this.phase += phaseIncrement;
+            }
+        }
+
+        // Normalize phase
+        this.phase = this.phase % TWO_PI;
+        if (this.phase < 0) this.phase += TWO_PI;
+
+        return offset + totalSamples;
+    }
+
+    /**
+     * Reset phase accumulator
+     */
+    reset(): void {
+        this.phase = 0;
+    }
 }
 
 /**
  * SSTV Image Encoder
+ * 
+ * Encodes RGB image data to SSTV audio signals.
+ * Supports all major SSTV modes including RGB and YCrCb color spaces.
  */
 export class SSTVEncoder {
-    private mode: SSTVMode;
-    private sampleRate: number;
-    private addCalibrationHeader: boolean;
-    private addVoxTones: boolean;
-    private phase: number = 0; // Phase accumulator for continuity
+    private readonly mode: SSTVMode;
+    private readonly sampleRate: number;
+    private readonly addCalibrationHeader: boolean;
+    private readonly addVoxTones: boolean;
+    private readonly phaseAccumulator: PhaseAccumulator;
 
     constructor(options: EncoderOptions) {
         const sampleRate = options.sampleRate ?? CONST.DEFAULT_SAMPLE_RATE;
@@ -69,6 +123,44 @@ export class SSTVEncoder {
         this.sampleRate = sampleRate;
         this.addCalibrationHeader = options.addCalibrationHeader ?? true;
         this.addVoxTones = options.addVoxTones ?? false;
+        this.phaseAccumulator = new PhaseAccumulator(sampleRate);
+    }
+
+    /**
+     * Calculate the total number of samples needed for encoding
+     */
+    private calculateTotalSamples(height: number): number {
+        let totalDuration = 0;
+
+        // VOX tones: 100ms tone + 100ms silence + 100ms tone + 100ms silence
+        if (this.addVoxTones) {
+            totalDuration += 0.4;
+        }
+
+        // Calibration header
+        if (this.addCalibrationHeader) {
+            totalDuration += CONST.CALIB_HEADER_DURATION;
+            // VIS code: 8 data bits + 1 stop bit = 9 * 30ms
+            totalDuration += 9 * CONST.VIS_BIT_DURATION;
+        }
+
+        // Start sync for Scottie modes
+        if (this.mode.hasStartSync) {
+            totalDuration += 0.009;
+        }
+
+        // Image data - check if PD mode (4 channels)
+        const isPDMode = this.mode.channelCount === 4 && this.mode.colorFormat === ColorFormat.YCrCb;
+
+        if (isPDMode) {
+            // PD modes: one lineTime per 2 image lines
+            totalDuration += (height / 2) * this.mode.lineTime;
+        } else {
+            totalDuration += height * this.mode.lineTime;
+        }
+
+        // Add small buffer for rounding
+        return Math.ceil(totalDuration * this.sampleRate) + 1000;
     }
 
     /**
@@ -80,7 +172,7 @@ export class SSTVEncoder {
      */
     encode(imageData: Uint8Array, width: number, height: number): Float32Array {
         // Reset phase for new encoding
-        this.phase = 0;
+        this.phaseAccumulator.reset();
 
         // Validate and resize image if needed
         if (width !== this.mode.width || height !== this.mode.height) {
@@ -92,29 +184,31 @@ export class SSTVEncoder {
         // Convert to mode's color space
         const channels = this.convertToColorSpace(imageData, width, height);
 
-        // Build audio buffer
-        const buffers: Float32Array[] = [];
+        // Pre-allocate output buffer
+        const totalSamples = this.calculateTotalSamples(height);
+        const buffer = new Float32Array(totalSamples);
+        let offset = 0;
 
         // Add VOX tones if requested
         if (this.addVoxTones) {
-            buffers.push(this.generateVoxTones());
+            offset = this.writeVoxTones(buffer, offset);
         }
 
         // Add calibration header
         if (this.addCalibrationHeader) {
-            buffers.push(this.generateCalibrationHeader());
-            buffers.push(this.generateVISCode());
+            offset = this.writeCalibrationHeader(buffer, offset);
+            offset = this.writeVISCode(buffer, offset);
         }
 
         // Generate image data
-        buffers.push(this.generateImageData(channels));
+        offset = this.writeImageData(buffer, offset, channels);
 
-        // Concatenate all buffers
-        return this.concatenateBuffers(buffers);
+        // Return trimmed buffer
+        return buffer.subarray(0, offset);
     }
 
     /**
-     * Resize image using nearest neighbor
+     * Resize image using nearest neighbor interpolation
      */
     private resizeImage(
         src: Uint8Array,
@@ -124,14 +218,18 @@ export class SSTVEncoder {
         dstHeight: number
     ): Uint8Array {
         const dst = new Uint8Array(dstWidth * dstHeight * 3);
+        const xRatio = srcWidth / dstWidth;
+        const yRatio = srcHeight / dstHeight;
 
         for (let y = 0; y < dstHeight; y++) {
-            for (let x = 0; x < dstWidth; x++) {
-                const srcX = Math.floor(x * srcWidth / dstWidth);
-                const srcY = Math.floor(y * srcHeight / dstHeight);
+            const srcY = Math.floor(y * yRatio);
+            const srcRowOffset = srcY * srcWidth * 3;
+            const dstRowOffset = y * dstWidth * 3;
 
-                const srcIdx = (srcY * srcWidth + srcX) * 3;
-                const dstIdx = (y * dstWidth + x) * 3;
+            for (let x = 0; x < dstWidth; x++) {
+                const srcX = Math.floor(x * xRatio);
+                const srcIdx = srcRowOffset + srcX * 3;
+                const dstIdx = dstRowOffset + x * 3;
 
                 dst[dstIdx] = src[srcIdx];
                 dst[dstIdx + 1] = src[srcIdx + 1];
@@ -153,8 +251,10 @@ export class SSTVEncoder {
         );
 
         for (let y = 0; y < height; y++) {
+            const rowOffset = y * width * 3;
+
             for (let x = 0; x < width; x++) {
-                const idx = (y * width + x) * 3;
+                const idx = rowOffset + x * 3;
                 const r = imageData[idx];
                 const g = imageData[idx + 1];
                 const b = imageData[idx + 2];
@@ -168,9 +268,7 @@ export class SSTVEncoder {
                     channels[0][y][x] = yVal;
 
                     if (this.mode.channelCount === 2) {
-                        // Robot 36
-                        // Even lines (1500Hz sep): V (red chroma)
-                        // Odd lines (2300Hz sep): U (blue chroma)
+                        // Robot 36: Even lines = V, Odd lines = U
                         channels[1][y][x] = (y % 2 === 0) ? v : u;
                     } else if (this.mode.channelCount >= 3) {
                         // Robot 72 and PD modes
@@ -178,7 +276,6 @@ export class SSTVEncoder {
                         channels[2][y][x] = u;
                     }
                 } else if (this.mode.colorFormat === ColorFormat.Grayscale) {
-                    // Convert to grayscale
                     const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
                     channels[0][y][x] = gray;
                 }
@@ -189,95 +286,81 @@ export class SSTVEncoder {
     }
 
     /**
-     * Generate VOX tones
+     * Helper to convert duration to samples
      */
-    private generateVoxTones(): Float32Array {
-        const buffers: Float32Array[] = [];
-
-        // 1900Hz for 100ms, silence for 100ms, repeated
-        let result = generateTone(1900, 0.1, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
-
-        buffers.push(new Float32Array(Math.floor(0.1 * this.sampleRate)));
-
-        result = generateTone(1900, 0.1, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
-
-        buffers.push(new Float32Array(Math.floor(0.1 * this.sampleRate)));
-
-        return this.concatenateBuffers(buffers);
+    private durationToSamples(duration: number): number {
+        return Math.floor(duration * this.sampleRate);
     }
 
     /**
-     * Generate calibration header
+     * Write VOX tones to buffer
      */
-    private generateCalibrationHeader(): Float32Array {
-        const buffers: Float32Array[] = [];
+    private writeVoxTones(buffer: Float32Array, offset: number): number {
+        const toneSamples = this.durationToSamples(0.1);
+        const silenceSamples = this.durationToSamples(0.1);
 
+        offset = this.phaseAccumulator.generateTone(buffer, offset, 1900, toneSamples);
+        offset += silenceSamples; // Silence (buffer already zeroed)
+        offset = this.phaseAccumulator.generateTone(buffer, offset, 1900, toneSamples);
+        offset += silenceSamples;
+
+        return offset;
+    }
+
+    /**
+     * Write calibration header to buffer
+     */
+    private writeCalibrationHeader(buffer: Float32Array, offset: number): number {
         // Leader tone 1: 1900Hz for 300ms
-        let result = generateTone(CONST.FREQ_LEADER, CONST.CALIB_LEADER_1, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_LEADER,
+            this.durationToSamples(CONST.CALIB_LEADER_1));
 
         // Break: 1200Hz for 10ms
-        result = generateTone(CONST.FREQ_SYNC, CONST.CALIB_BREAK, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_SYNC,
+            this.durationToSamples(CONST.CALIB_BREAK));
 
         // Leader tone 2: 1900Hz for 300ms
-        result = generateTone(CONST.FREQ_LEADER, CONST.CALIB_LEADER_2, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_LEADER,
+            this.durationToSamples(CONST.CALIB_LEADER_2));
 
         // VIS start bit: 1200Hz for 30ms
-        result = generateTone(CONST.FREQ_VIS_START, CONST.CALIB_VIS_START, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_VIS_START,
+            this.durationToSamples(CONST.CALIB_VIS_START));
 
-        return this.concatenateBuffers(buffers);
+        return offset;
     }
 
     /**
-     * Generate VIS code
+     * Write VIS code to buffer
      */
-    private generateVISCode(): Float32Array {
+    private writeVISCode(buffer: Float32Array, offset: number): number {
         const visCode = this.mode.id;
-        const buffers: Float32Array[] = [];
+        const bitSamples = this.durationToSamples(CONST.VIS_BIT_DURATION);
 
-        // Convert VIS code to binary (LSB first)
-        const bits: number[] = [];
+        // Extract 7 data bits (LSB first) and calculate even parity
+        let parityCount = 0;
         for (let i = 0; i < 7; i++) {
-            bits.push((visCode >> i) & 1);
-        }
-
-        // Calculate even parity
-        const parity = bits.reduce((a, b) => a + b, 0) % 2 === 0 ? 0 : 1;
-        bits.push(parity);
-
-        // Generate bit tones
-        for (const bit of bits) {
+            const bit = (visCode >> i) & 1;
+            parityCount += bit;
             const freq = bit === 1 ? CONST.FREQ_VIS_BIT1 : CONST.FREQ_VIS_BIT0;
-            const result = generateTone(freq, CONST.VIS_BIT_DURATION, this.sampleRate, this.phase);
-            buffers.push(result.buffer);
-            this.phase = result.endPhase;
+            offset = this.phaseAccumulator.generateTone(buffer, offset, freq, bitSamples);
         }
+
+        // Parity bit (even parity)
+        const parityBit = parityCount % 2;
+        const parityFreq = parityBit === 1 ? CONST.FREQ_VIS_BIT1 : CONST.FREQ_VIS_BIT0;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, parityFreq, bitSamples);
 
         // Stop bit: 1200Hz for 30ms
-        const result = generateTone(CONST.FREQ_VIS_START, CONST.VIS_STOP_BIT_DURATION, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_VIS_START, bitSamples);
 
-        return this.concatenateBuffers(buffers);
+        return offset;
     }
 
     /**
-     * Generate image data
-     * Special handling for PD modes which encode 2 lines per sync pulse
+     * Write image data to buffer
      */
-    private generateImageData(channels: number[][][]): Float32Array {
-        const buffers: Float32Array[] = [];
+    private writeImageData(buffer: Float32Array, offset: number, channels: number[][][]): number {
         const height = channels[0].length;
 
         // Check if this is a PD mode (4 channels = Y-even, V, U, Y-odd)
@@ -285,189 +368,118 @@ export class SSTVEncoder {
 
         // Start sync for Scottie modes
         if (this.mode.hasStartSync) {
-            const result = generateTone(CONST.FREQ_SYNC, 0.009, this.sampleRate, this.phase);
-            buffers.push(result.buffer);
-            this.phase = result.endPhase;
+            offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_SYNC,
+                this.durationToSamples(0.009));
         }
 
         if (isPDMode) {
             // PD modes: encode 2 lines per sync pulse
-            // Structure: Sync + Porch + Y-even + V + U + Y-odd
             for (let linePair = 0; linePair < height / 2; linePair++) {
-                buffers.push(this.generatePDLinePair(channels, linePair));
+                offset = this.writePDLinePair(buffer, offset, channels, linePair);
             }
         } else {
             // Regular modes: encode line by line
             for (let line = 0; line < height; line++) {
-                buffers.push(this.generateLine(channels, line));
+                offset = this.writeLine(buffer, offset, channels, line);
             }
         }
 
-        return this.concatenateBuffers(buffers);
+        return offset;
     }
 
     /**
-     * Generate a PD mode line pair (2 image lines from 1 sync pulse)
-     * Structure: Sync + Porch + Y-even + V + U + Y-odd
-     * V and U are averaged from both even and odd lines
+     * Write a PD mode line pair (2 image lines from 1 sync pulse)
      */
-    private generatePDLinePair(channels: number[][][], linePair: number): Float32Array {
-        const buffers: Float32Array[] = [];
+    private writePDLinePair(buffer: Float32Array, offset: number, channels: number[][][], linePair: number): number {
         const evenLine = linePair * 2;
         const oddLine = linePair * 2 + 1;
+        const width = this.mode.width;
 
         // Sync pulse
-        let result = generateTone(CONST.FREQ_SYNC, this.mode.syncPulse, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_SYNC,
+            this.durationToSamples(this.mode.syncPulse));
 
-        result = generateTone(CONST.FREQ_PORCH, this.mode.syncPorch, this.sampleRate, this.phase);
-        buffers.push(result.buffer);
-        this.phase = result.endPhase;
+        // Porch
+        offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_PORCH,
+            this.durationToSamples(this.mode.syncPorch));
 
-        // Y-even channel (channel 0, even line)
-        buffers.push(this.generateChannel(channels[0][evenLine], 0, evenLine));
+        // Y-even channel
+        offset = this.phaseAccumulator.generatePixelLine(buffer, offset, channels[0][evenLine],
+            this.mode.getScanTime(evenLine, 0));
 
-        // V channel (channel 1, averaged from both lines)
-        const avgV = new Array(this.mode.width);
-        for (let x = 0; x < this.mode.width; x++) {
+        // V channel (averaged from both lines)
+        const avgV = new Array(width);
+        for (let x = 0; x < width; x++) {
             avgV[x] = Math.round((channels[1][evenLine][x] + channels[1][oddLine][x]) / 2);
         }
-        buffers.push(this.generateChannel(avgV, 1, evenLine));
+        offset = this.phaseAccumulator.generatePixelLine(buffer, offset, avgV,
+            this.mode.getScanTime(evenLine, 1));
 
-        // U channel (channel 2, averaged from both lines)
-        const avgU = new Array(this.mode.width);
-        for (let x = 0; x < this.mode.width; x++) {
+        // U channel (averaged from both lines)
+        const avgU = new Array(width);
+        for (let x = 0; x < width; x++) {
             avgU[x] = Math.round((channels[2][evenLine][x] + channels[2][oddLine][x]) / 2);
         }
-        buffers.push(this.generateChannel(avgU, 2, evenLine));
+        offset = this.phaseAccumulator.generatePixelLine(buffer, offset, avgU,
+            this.mode.getScanTime(evenLine, 2));
 
-        // Y-odd channel (channel 0, odd line)
-        buffers.push(this.generateChannel(channels[0][oddLine], 0, oddLine));
+        // Y-odd channel
+        offset = this.phaseAccumulator.generatePixelLine(buffer, offset, channels[0][oddLine],
+            this.mode.getScanTime(oddLine, 3));
 
-        return this.concatenateBuffers(buffers);
+        return offset;
     }
 
     /**
-     * Generate a single scanline
+     * Write a single scanline
      */
-    private generateLine(channels: number[][][], line: number): Float32Array {
-        const buffers: Float32Array[] = [];
-
+    private writeLine(buffer: Float32Array, offset: number, channels: number[][][], line: number): number {
         // Sync pulse (for most modes, except Scottie which has it in the middle)
         if (this.mode.syncChannel === undefined || this.mode.syncChannel === 0) {
-            let result = generateTone(CONST.FREQ_SYNC, this.mode.syncPulse, this.sampleRate, this.phase);
-            buffers.push(result.buffer);
-            this.phase = result.endPhase;
-
-            result = generateTone(CONST.FREQ_PORCH, this.mode.syncPorch, this.sampleRate, this.phase);
-            buffers.push(result.buffer);
-            this.phase = result.endPhase;
+            offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_SYNC,
+                this.durationToSamples(this.mode.syncPulse));
+            offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_PORCH,
+                this.durationToSamples(this.mode.syncPorch));
         }
 
         // Generate each channel
         for (let ch = 0; ch < this.mode.channelCount; ch++) {
-            // Get the actual channel index based on channelOrder
-            // channelOrder maps: transmit position -> channel index
             const channelIndex = this.mode.channelOrder[ch];
 
-            // Separator before channel (for some modes)
+            // Special separator handling for Robot modes
             if (this.mode.id === 8 && ch === 1) {
-                // Robot 36 channel 1: needs 4.5ms separator + 1.5ms porch
-                // Separator frequency alternates: 1500 Hz (even lines), 2300 Hz (odd lines)
+                // Robot 36: 4.5ms separator + 1.5ms porch before chroma
                 const sepFreq = (line % 2 === 0) ? CONST.FREQ_SEPARATOR_EVEN : CONST.FREQ_SEPARATOR_ODD;
-                let result = generateTone(sepFreq, 0.0045, this.sampleRate, this.phase);
-                buffers.push(result.buffer);
-                this.phase = result.endPhase;
-
-                result = generateTone(CONST.FREQ_LEADER, 0.0015, this.sampleRate, this.phase);
-                buffers.push(result.buffer);
-                this.phase = result.endPhase;
-            } else if (this.mode.id === 12) {
-                // Robot 72: special separator handling
-                // Channel 0 (Y): no separator before
-                // Channel 1 (V): 4.5ms at 1500Hz sep + 1.5ms at 1900Hz porch
-                // Channel 2 (U): 4.5ms at 2300Hz sep + 1.5ms at 1500Hz porch
-                if (ch > 0) {
-                    const sepFreq = (ch === 1) ? CONST.FREQ_SEPARATOR_EVEN : CONST.FREQ_SEPARATOR_ODD;
-                    const porchFreq = (ch === 1) ? CONST.FREQ_LEADER : CONST.FREQ_SEPARATOR_EVEN;
-                    let result = generateTone(sepFreq, 0.0045, this.sampleRate, this.phase);
-                    buffers.push(result.buffer);
-                    this.phase = result.endPhase;
-
-                    result = generateTone(porchFreq, 0.0015, this.sampleRate, this.phase);
-                    buffers.push(result.buffer);
-                    this.phase = result.endPhase;
-                }
-                // Skip any base case separator handling for Robot 72
+                offset = this.phaseAccumulator.generateTone(buffer, offset, sepFreq,
+                    this.durationToSamples(0.0045));
+                offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_LEADER,
+                    this.durationToSamples(0.0015));
+            } else if (this.mode.id === 12 && ch > 0) {
+                // Robot 72: separator handling
+                const sepFreq = (ch === 1) ? CONST.FREQ_SEPARATOR_EVEN : CONST.FREQ_SEPARATOR_ODD;
+                const porchFreq = (ch === 1) ? CONST.FREQ_LEADER : CONST.FREQ_SEPARATOR_EVEN;
+                offset = this.phaseAccumulator.generateTone(buffer, offset, sepFreq,
+                    this.durationToSamples(0.0045));
+                offset = this.phaseAccumulator.generateTone(buffer, offset, porchFreq,
+                    this.durationToSamples(0.0015));
             } else if (this.mode.separatorPulses[ch] > 0) {
-                const result = generateTone(CONST.FREQ_PORCH, this.mode.separatorPulses[ch], this.sampleRate, this.phase);
-                buffers.push(result.buffer);
-                this.phase = result.endPhase;
+                offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_PORCH,
+                    this.durationToSamples(this.mode.separatorPulses[ch]));
             }
 
-            // Generate channel data
-            buffers.push(this.generateChannel(channels[channelIndex][line], ch, line));
+            // Generate channel pixel data
+            offset = this.phaseAccumulator.generatePixelLine(buffer, offset, channels[channelIndex][line],
+                this.mode.getScanTime(line, ch));
 
             // Sync pulse in the middle (Scottie modes)
             if (this.mode.syncChannel === ch + 1) {
-                let result = generateTone(CONST.FREQ_SYNC, this.mode.syncPulse, this.sampleRate, this.phase);
-                buffers.push(result.buffer);
-                this.phase = result.endPhase;
-
-                result = generateTone(CONST.FREQ_PORCH, this.mode.syncPorch, this.sampleRate, this.phase);
-                buffers.push(result.buffer);
-                this.phase = result.endPhase;
+                offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_SYNC,
+                    this.durationToSamples(this.mode.syncPulse));
+                offset = this.phaseAccumulator.generateTone(buffer, offset, CONST.FREQ_PORCH,
+                    this.durationToSamples(this.mode.syncPorch));
             }
         }
 
-        return this.concatenateBuffers(buffers);
-    }
-
-    /**
-     * Generate a single channel scanline with continuous phase
-     */
-    private generateChannel(pixelData: number[], channel: number, line: number): Float32Array {
-        const scanTime = this.mode.getScanTime(line, channel);
-        const totalSamples = Math.floor(scanTime * this.sampleRate);
-        const buffer = new Float32Array(totalSamples);
-
-        const samplesPerPixel = totalSamples / this.mode.width;
-
-        for (let pixel = 0; pixel < this.mode.width; pixel++) {
-            const value = pixelData[pixel];
-            const freq = pixelToFrequency(value);
-            const phaseIncrement = (2 * Math.PI * freq) / this.sampleRate;
-
-            const startSample = Math.floor(pixel * samplesPerPixel);
-            const endSample = Math.min(Math.floor((pixel + 1) * samplesPerPixel), totalSamples);
-
-            for (let s = startSample; s < endSample; s++) {
-                buffer[s] = Math.sin(this.phase);
-                this.phase += phaseIncrement;
-            }
-        }
-
-        // Normalize phase
-        this.phase = this.phase % (2 * Math.PI);
-        if (this.phase < 0) this.phase += 2 * Math.PI;
-
-        return buffer;
-    }
-
-    /**
-     * Concatenate multiple Float32Arrays
-     */
-    private concatenateBuffers(buffers: Float32Array[]): Float32Array {
-        const totalLength = buffers.reduce((sum, buf) => sum + buf.length, 0);
-        const result = new Float32Array(totalLength);
-
-        let offset = 0;
-        for (const buffer of buffers) {
-            result.set(buffer, offset);
-            offset += buffer.length;
-        }
-
-        return result;
+        return offset;
     }
 }

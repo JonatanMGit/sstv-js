@@ -287,7 +287,14 @@ export function saveWavFile(
 
 /**
  * Resample audio to a different sample rate
- * Simple linear interpolation - for better quality, use a proper resampler
+ * 
+ * Uses windowed sinc interpolation for high-quality resampling.
+ * Falls back to linear interpolation for very small rate changes.
+ * 
+ * @param samples Input audio samples
+ * @param fromRate Source sample rate
+ * @param toRate Target sample rate
+ * @returns Resampled audio samples
  */
 export function resampleAudio(
     samples: Float32Array,
@@ -302,17 +309,74 @@ export function resampleAudio(
     const newLength = Math.floor(samples.length / ratio);
     const resampled = new Float32Array(newLength);
 
+    // For small rate changes (< 5%), use linear interpolation (faster)
+    if (Math.abs(ratio - 1.0) < 0.05) {
+        for (let i = 0; i < newLength; i++) {
+            const srcPos = i * ratio;
+            const srcIndex = Math.floor(srcPos);
+            const frac = srcPos - srcIndex;
+
+            if (srcIndex + 1 < samples.length) {
+                resampled[i] = samples[srcIndex] * (1 - frac) + samples[srcIndex + 1] * frac;
+            } else {
+                resampled[i] = samples[srcIndex] ?? 0;
+            }
+        }
+        return resampled;
+    }
+
+    // Use windowed sinc interpolation for larger rate changes
+    // This provides better quality for upsampling/downsampling
+    const windowSize = 16; // Half-window size (total window = 2 * windowSize + 1)
+
+    // Precompute sinc window coefficients
+    const sincTable = new Float32Array(windowSize * 2 + 1);
+    for (let i = 0; i <= windowSize * 2; i++) {
+        const x = i - windowSize;
+        if (x === 0) {
+            sincTable[i] = 1.0;
+        } else {
+            // Lanczos window (sinc * sinc)
+            const piX = Math.PI * x;
+            const piXa = piX / windowSize;
+            sincTable[i] = (Math.sin(piX) / piX) * (Math.sin(piXa) / piXa);
+        }
+    }
+
+    // Resample with windowed sinc interpolation
     for (let i = 0; i < newLength; i++) {
         const srcPos = i * ratio;
         const srcIndex = Math.floor(srcPos);
         const frac = srcPos - srcIndex;
 
-        if (srcIndex + 1 < samples.length) {
-            // Linear interpolation
-            resampled[i] = samples[srcIndex] * (1 - frac) + samples[srcIndex + 1] * frac;
-        } else {
-            resampled[i] = samples[srcIndex];
+        let sum = 0;
+        let weightSum = 0;
+
+        for (let j = -windowSize; j <= windowSize; j++) {
+            const idx = srcIndex + j;
+            if (idx >= 0 && idx < samples.length) {
+                const offset = j - frac;
+                // Interpolate sinc value
+                const sincIdx = (offset + windowSize);
+                const sincIdxFloor = Math.floor(sincIdx);
+                const sincFrac = sincIdx - sincIdxFloor;
+
+                let weight: number;
+                if (sincIdxFloor >= 0 && sincIdxFloor < sincTable.length - 1) {
+                    weight = sincTable[sincIdxFloor] * (1 - sincFrac) +
+                        sincTable[sincIdxFloor + 1] * sincFrac;
+                } else if (sincIdxFloor >= 0 && sincIdxFloor < sincTable.length) {
+                    weight = sincTable[sincIdxFloor];
+                } else {
+                    weight = 0;
+                }
+
+                sum += samples[idx] * weight;
+                weightSum += weight;
+            }
         }
+
+        resampled[i] = weightSum > 0 ? sum / weightSum : 0;
     }
 
     return resampled;

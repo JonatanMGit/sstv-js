@@ -81,15 +81,21 @@ export function yuvToRgb(y: number, u: number, v: number): [number, number, numb
 /**
  * Interpolate chroma values for 4:2:0 subsampling
  * Robot 36 standard: Even=V(red), Odd=U(blue)
+ * 
+ * @param currentLine - Current line being processed
+ * @param height - Total image height
+ * @param chromaData - Image data array [line][channel][pixel]
+ * @param width - Image width in pixels
+ * @returns Interpolated U and V chroma arrays for the current line
  */
 export function interpolateChroma(
     currentLine: number,
     height: number,
-    chromaData: number[][][],
+    chromaData: readonly (readonly (readonly number[])[])[] | number[][][],
     width: number
 ): { u: number[], v: number[] } {
-    const u = new Array(width);
-    const v = new Array(width);
+    const u = new Array<number>(width);
+    const v = new Array<number>(width);
 
     // Determine the even/odd line pair
     const pairStart = currentLine - (currentLine % 2); // Round down to even

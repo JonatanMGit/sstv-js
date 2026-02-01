@@ -1,58 +1,46 @@
 /**
  * FFT and frequency analysis utilities
+ * 
+ * This module provides a higher-level frequency analyzer that
+ * builds on the FFTPeakFinder for more advanced analysis.
  */
 
 import FFT from 'fft.js';
+import { hannWindow, quadraticPeakInterp } from './fft-helper';
+
+// Re-export createHannWindow for backwards compatibility
+export { hannWindow as createHannWindow } from './fft-helper';
 
 /**
- * Hann window function for FFT
- */
-export function createHannWindow(length: number): Float32Array {
-    const window = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-        window[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (length - 1)));
-    }
-    return window;
-}
-
-/**
- * Barycentric peak interpolation for sub-bin frequency estimation
+ * Quadratic peak interpolation for sub-bin frequency estimation
+ * @deprecated Use quadraticPeakInterp from fft-helper instead
  */
 export function barycentricPeakInterpolation(bins: Float32Array, peakIndex: number): number {
-    if (peakIndex <= 0 || peakIndex >= bins.length - 1) {
-        return peakIndex;
-    }
-
-    const y1 = bins[peakIndex - 1];
-    const y2 = bins[peakIndex];
-    const y3 = bins[peakIndex + 1];
-
-    const denom = y3 + y2 + y1;
-    if (denom === 0) return peakIndex;
-
-    return (y3 - y1) / denom + peakIndex;
+    return quadraticPeakInterp(bins, peakIndex);
 }
 
 /**
  * FFT-based frequency analyzer
+ * 
+ * Uses preallocated buffers and cached Hann window for performance.
  */
 export class FrequencyAnalyzer {
-    private fft: FFT;
-    private fftSize: number;
-    private sampleRate: number;
-    private inputBuffer: Float32Array;
-    private outputBuffer: Float32Array;
-    private magnitudes: Float32Array;
-    private window: Float32Array;
+    private readonly fft: FFT;
+    private readonly fftSize: number;
+    private readonly sampleRate: number;
+    private readonly freqPerBin: number;
+    private readonly inputBuffer: Float32Array;
+    private readonly outputBuffer: Float32Array;
+    private readonly magnitudes: Float32Array;
 
     constructor(fftSize: number, sampleRate: number) {
         this.fftSize = fftSize;
         this.sampleRate = sampleRate;
+        this.freqPerBin = sampleRate / fftSize;
         this.fft = new FFT(fftSize);
         this.inputBuffer = new Float32Array(fftSize);
         this.outputBuffer = new Float32Array(fftSize * 2);
         this.magnitudes = new Float32Array(fftSize / 2 + 1);
-        this.window = createHannWindow(fftSize);
     }
 
     /**
@@ -60,11 +48,12 @@ export class FrequencyAnalyzer {
      */
     getPeakFrequency(samples: Float32Array): number {
         const len = Math.min(samples.length, this.fftSize);
+        const window = hannWindow(len);
 
         // Apply window and copy to input buffer
         this.inputBuffer.fill(0);
         for (let i = 0; i < len; i++) {
-            this.inputBuffer[i] = samples[i] * this.window[i];
+            this.inputBuffer[i] = samples[i] * window[i];
         }
 
         // Perform FFT
@@ -73,11 +62,12 @@ export class FrequencyAnalyzer {
         // Calculate magnitudes and find peak
         let maxMagnitude = -1;
         let peakBin = 0;
+        const magLen = this.magnitudes.length;
 
-        for (let i = 0; i < this.magnitudes.length; i++) {
+        for (let i = 0; i < magLen; i++) {
             const real = this.outputBuffer[2 * i];
             const imag = this.outputBuffer[2 * i + 1];
-            const magnitude = Math.sqrt(real * real + imag * imag);
+            const magnitude = real * real + imag * imag; // Use squared magnitude for comparison
             this.magnitudes[i] = magnitude;
 
             if (magnitude > maxMagnitude) {
@@ -86,18 +76,25 @@ export class FrequencyAnalyzer {
             }
         }
 
-        // Interpolate for sub-bin accuracy
-        const interpolatedBin = barycentricPeakInterpolation(this.magnitudes, peakBin);
+        // Convert to linear magnitude for interpolation (only around peak)
+        if (peakBin > 0 && peakBin < magLen - 1) {
+            this.magnitudes[peakBin - 1] = Math.sqrt(this.magnitudes[peakBin - 1]);
+            this.magnitudes[peakBin] = Math.sqrt(this.magnitudes[peakBin]);
+            this.magnitudes[peakBin + 1] = Math.sqrt(this.magnitudes[peakBin + 1]);
+        }
+
+        // Interpolate for sub-bin accuracy using quadratic interpolation
+        const interpolatedBin = quadraticPeakInterp(this.magnitudes, peakBin);
 
         // Convert bin to frequency
-        return interpolatedBin * this.sampleRate / this.fftSize;
+        return interpolatedBin * this.freqPerBin;
     }
 
     /**
      * Get frequency resolution (Hz per bin)
      */
     getFrequencyResolution(): number {
-        return this.sampleRate / this.fftSize;
+        return this.freqPerBin;
     }
 
     /**
@@ -105,15 +102,16 @@ export class FrequencyAnalyzer {
      */
     getMagnitudeAtFrequency(samples: Float32Array, targetFreq: number): number {
         const len = Math.min(samples.length, this.fftSize);
+        const window = hannWindow(len);
 
         this.inputBuffer.fill(0);
         for (let i = 0; i < len; i++) {
-            this.inputBuffer[i] = samples[i] * this.window[i];
+            this.inputBuffer[i] = samples[i] * window[i];
         }
 
         this.fft.realTransform(this.outputBuffer, this.inputBuffer);
 
-        const bin = Math.round(targetFreq * this.fftSize / this.sampleRate);
+        const bin = Math.round(targetFreq / this.freqPerBin);
         if (bin < 0 || bin >= this.magnitudes.length) return 0;
 
         const real = this.outputBuffer[2 * bin];
