@@ -1,0 +1,41 @@
+{
+  "name": "sstv-js",
+  "version": "0.0.1",
+  "description": "SSTV encoder/decoder",
+  "keywords": [
+    "SSTV"
+  ],
+  "homepage": "https://github.com/JonatanMGit/sstv-js#readme",
+  "bugs": {
+    "url": "https://github.com/JonatanMGit/sstv-js/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonatanMGit/sstv-js.git"
+  },
+  "license": "MIT",
+  "author": "Jonatan Miarecki",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "canvas": "^3.2.1",
+    "fft.js": "^4.0.4",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
