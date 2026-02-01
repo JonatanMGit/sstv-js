@@ -383,6 +383,23 @@ export class SSTVEncoder {
                 result = generateTone(CONST.FREQ_LEADER, 0.0015, this.sampleRate, this.phase);
                 buffers.push(result.buffer);
                 this.phase = result.endPhase;
+            } else if (this.mode.id === 12) {
+                // Robot 72: special separator handling
+                // Channel 0 (Y): no separator before
+                // Channel 1 (V): 4.5ms at 1500Hz sep + 1.5ms at 1900Hz porch
+                // Channel 2 (U): 4.5ms at 2300Hz sep + 1.5ms at 1500Hz porch
+                if (ch > 0) {
+                    const sepFreq = (ch === 1) ? CONST.FREQ_SEPARATOR_EVEN : CONST.FREQ_SEPARATOR_ODD;
+                    const porchFreq = (ch === 1) ? CONST.FREQ_LEADER : CONST.FREQ_SEPARATOR_EVEN;
+                    let result = generateTone(sepFreq, 0.0045, this.sampleRate, this.phase);
+                    buffers.push(result.buffer);
+                    this.phase = result.endPhase;
+
+                    result = generateTone(porchFreq, 0.0015, this.sampleRate, this.phase);
+                    buffers.push(result.buffer);
+                    this.phase = result.endPhase;
+                }
+                // Skip any base case separator handling for Robot 72
             } else if (this.mode.separatorPulses[ch] > 0) {
                 const result = generateTone(CONST.FREQ_PORCH, this.mode.separatorPulses[ch], this.sampleRate, this.phase);
                 buffers.push(result.buffer);

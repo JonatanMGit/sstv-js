@@ -479,6 +479,17 @@ export class SSTVDecoder extends EventEmitter {
 
         let seqStart = startSample;
 
+        // Check if this is a Scottie-style mode (sync in the middle of line)
+        const hasMidSync = this.mode.syncChannel !== undefined && this.mode.syncChannel > 0;
+
+        // For modes with start sync, align to END of start sync
+        if (this.mode.hasStartSync) {
+            const aligned = this.alignSync(seqStart, false); // false = end of sync
+            if (aligned !== null) {
+                seqStart = aligned;
+            }
+        }
+
         if (isPDMode) {
             // PD modes: decode 2 lines per sync pulse
             // Each scan line contains: Y-even, V, U, Y-odd
@@ -542,8 +553,64 @@ export class SSTVDecoder extends EventEmitter {
                 imageData.linesDecoded = oddLine + 1;
                 this.emit('lineDecoded', oddLine, null, imageData);
             }
+        } else if (hasMidSync) {
+            // Scottie-style modes: sync is in the middle of the line (between Blue and Red)
+            // For line 0 with hasStartSync, adjust seq_start backwards
+            if (this.mode.hasStartSync && this.mode.syncChannel !== undefined) {
+                const syncChannelOffset = this.mode.getChannelOffset(0, this.mode.syncChannel);
+                const syncChannelScanTime = this.mode.getScanTime(0, this.mode.syncChannel);
+                seqStart -= Math.round((syncChannelOffset + syncChannelScanTime) * this.sampleRate);
+            }
+
+            for (let line = 0; line < this.mode.height; line++) {
+                // Decode each channel
+                for (let ch = 0; ch < this.mode.channelCount; ch++) {
+                    // Re-align to sync at syncChannel
+                    if (ch === this.mode.syncChannel) {
+                        if (line > 0 || ch > 0) {
+                            seqStart += Math.round(this.mode.lineTime * this.sampleRate);
+                        }
+
+                        const aligned = this.alignSync(seqStart, true);
+                        if (aligned !== null) {
+                            seqStart = aligned;
+                        } else if (line > 0) {
+                            this.emit('warning', 'Reached end of audio');
+                            break;
+                        }
+                    }
+
+                    const channelOffset = this.mode.getChannelOffset(line, ch);
+                    const channelStart = seqStart + Math.floor(channelOffset * this.sampleRate);
+                    const scanTime = this.mode.getScanTime(line, ch);
+
+                    // Calculate pixel time and window parameters
+                    const pixelTime = scanTime / this.mode.width;
+                    const centerWindowTime = (pixelTime * this.mode.windowFactor) / 2;
+                    const pixelWindow = Math.round(centerWindowTime * 2 * this.sampleRate);
+
+                    // Decode pixels for this channel
+                    for (let pixel = 0; pixel < this.mode.width; pixel++) {
+                        const centerPos = channelStart + (pixel * pixelTime) * this.sampleRate;
+                        const windowStart = Math.floor(centerPos - centerWindowTime * this.sampleRate);
+                        const windowEnd = Math.min(windowStart + pixelWindow, this.samples.length);
+
+                        if (windowEnd > windowStart && windowStart >= 0) {
+                            const audioWindow = this.samples.subarray(windowStart, windowEnd);
+                            const peakFreq = this.fftPeakFinder.findPeakFrequency(audioWindow);
+                            const value = FFTPeakFinder.frequencyToPixel(peakFreq);
+
+                            const actualChannel = this.mode.channelOrder[ch];
+                            imageData.channels[actualChannel][line * this.mode.width + pixel] = value;
+                        }
+                    }
+                }
+
+                imageData.linesDecoded = line + 1;
+                this.emit('lineDecoded', line, null, imageData);
+            }
         } else {
-            // Regular modes: decode line by line
+            // Regular modes: decode line by line (sync at start of each line)
             for (let line = 0; line < this.mode.height; line++) {
                 // Align to sync pulse for each line (fixing VIS start offset)
                 if (line > 0) {
@@ -658,12 +725,11 @@ export function imageDataToRGB(decoded: DecodedImage): Uint8Array {
                     rgb[idx + 2] = b;
                 } else if (mode.channelCount === 3) {
                     // Robot 72 - 4:2:2
-                    // Observed behavior: Channels are swapped relative to expectation
-                    // Swapping U and V arguments fixes the Blue/Red swap
-                    const crVal = data[y][1][x];  // V
-                    const cbVal = data[y][2][x];  // U
-                    // Swapped args to fix color: (y, v, u) instead of (y, u, v)
-                    const [r, g, b] = yuvToRgb(yVal, crVal, cbVal);
+                    // Channels are: 0=Y, 1=V(Cr), 2=U(Cb)
+                    // yuvToRgb expects (y, u, v) order
+                    const vVal = data[y][1][x];  // V (Cr)
+                    const uVal = data[y][2][x];  // U (Cb)
+                    const [r, g, b] = yuvToRgb(yVal, uVal, vVal);
                     rgb[idx] = r;
                     rgb[idx + 1] = g;
                     rgb[idx + 2] = b;
