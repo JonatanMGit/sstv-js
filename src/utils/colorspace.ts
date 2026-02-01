@@ -59,21 +59,17 @@ export function rgbToYUV(r: number, g: number, b: number): [number, number, numb
 
 /**
  * Convert YUV to RGB (Robot mode style)
- * Uses Rec. 601 coefficients
- * Y is in limited range [16-235]
+ * Uses Rec. 601 coefficients with FULL RANGE Y [0-255]
+ * This matches the encoder's rgbToYUV which outputs full range.
  * Parameter order: Y, U, V
  */
 export function yuvToRgb(y: number, u: number, v: number): [number, number, number] {
-    // Rec. 601 uses limited range Y [16-235]
-    const yNorm = y - 16;
     const uOffset = u - 128;
     const vOffset = v - 128;
 
-    // Using Rec. 601 matrix coefficients
-    // These are the integer approximations used: 298/256, 409/256, etc.
-    const r = ((298 * yNorm + 409 * vOffset + 128) / 256);
-    const g = ((298 * yNorm - 100 * uOffset - 208 * vOffset + 128) / 256);
-    const b = ((298 * yNorm + 516 * uOffset + 128) / 256);
+    const r = y + 1.402 * vOffset;
+    const g = y - 0.344136 * uOffset - 0.714136 * vOffset;
+    const b = y + 1.772 * uOffset;
 
     return [
         Math.max(0, Math.min(255, Math.round(r))),
