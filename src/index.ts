@@ -39,6 +39,17 @@
 export { SSTVDecoder, imageDataToRGB } from './decoder';
 export { SSTVEncoder } from './encoder';
 
+// Streaming decoder for real-time SDR applications
+export {
+    StreamingDecoder,
+    StreamingDecoderOptions,
+    StreamingDecoderEvents,
+    DecoderState,
+    LineEvent,
+    ImageCompleteEvent,
+    ModeDetectedEvent
+} from './streaming-decoder';
+
 // Types and interfaces
 export {
     SSTVMode,

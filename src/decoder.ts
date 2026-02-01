@@ -1,5 +1,8 @@
 /**
- * Streaming SSTV Decoder with FM demodulation
+ * Batch SSTV Decoder with FM demodulation
+ * 
+ * This decoder processes complete audio files and returns decoded images.
+ * For streaming/real-time decoding, use StreamingDecoder instead.
  */
 
 import { EventEmitter } from 'events';
@@ -10,26 +13,24 @@ import {
     ColorFormat
 } from './types';
 import { Demodulator, SyncPulseWidth } from './utils/demodulator';
-import { getModeByVIS, getAllModes } from './modes';
-import { frequencyToPixel } from './constants';
 import * as CONST from './constants';
-import { yCrCbToRgb, yuvToRgb, interpolateChroma } from './utils/colorspace';
 import { FFTPeakFinder } from './utils/fft-helper';
+import {
+    InternalImageData,
+    VISCandidate,
+    categorizeModesBySyncPulse,
+    calculateMean,
+    detectModeFromTiming,
+    denormalizeFrequency,
+    SyncHistoryTracker,
+    VISDecoder,
+    isPDMode,
+    hasMidSync,
+    imageDataToRGB
+} from './decoder-core';
 
 /**
- * Internal image data structure during decoding
- */
-interface InternalImageData {
-    readonly mode: SSTVMode;
-    readonly width: number;
-    readonly height: number;
-    readonly channels: Uint8Array[];
-    linesDecoded: number;
-    slantCorrection: number;
-}
-
-/**
- * Main streaming SSTV decoder class using FM demodulation
+ * Main batch SSTV decoder class using FM demodulation
  */
 export class SSTVDecoder extends EventEmitter {
     private readonly samples: Float32Array;
@@ -49,22 +50,20 @@ export class SSTVDecoder extends EventEmitter {
     private readonly syncPulse9msModes: SSTVMode[];
     private readonly syncPulse20msModes: SSTVMode[];
 
-    // Sync tracking
+    // Sync tracking using shared class
+    private readonly sync5ms: SyncHistoryTracker;
+    private readonly sync9ms: SyncHistoryTracker;
+    private readonly sync20ms: SyncHistoryTracker;
+
+    // State tracking
     private lastSyncPulseIndex: number = 0;
     private currentScanLineSamples: number = 0;
     private lastFrequencyOffset: number = 0;
 
-    // Recent sync pulses and scan lines for mode detection
-    private readonly last5msSyncPulses: number[];
-    private readonly last9msSyncPulses: number[];
-    private readonly last20msSyncPulses: number[];
-    private readonly last5msScanLines: number[];
-    private readonly last9msScanLines: number[];
-    private readonly last20msScanLines: number[];
-
     // VIS code detection
     private leaderBreakIndex: number = 0;
-    private visCandidates: Array<{ index: number; freqOffset: number }> = [];
+    private visCandidates: VISCandidate[] = [];
+    private readonly visDecoder: VISDecoder;
 
     // Detected sync pulses for image reconstruction
     private detectedSyncPulses: number[] = [];
@@ -89,50 +88,19 @@ export class SSTVDecoder extends EventEmitter {
         // Provides ~11.7Hz resolution at 48kHz
         this.fftPeakFinder = new FFTPeakFinder(4096, this.sampleRate);
 
-        // Initialize mode lists by sync pulse width
-        const { pulse5ms, pulse9ms, pulse20ms } = this.categorizeModesBySyncPulse();
+        // Initialize VIS decoder
+        this.visDecoder = new VISDecoder(this.sampleRate, this.fftPeakFinder);
+
+        // Initialize mode lists by sync pulse width (using shared function)
+        const { pulse5ms, pulse9ms, pulse20ms } = categorizeModesBySyncPulse();
         this.syncPulse5msModes = pulse5ms;
         this.syncPulse9msModes = pulse9ms;
         this.syncPulse20msModes = pulse20ms;
 
-        // Initialize sync tracking arrays with fixed size
-        const syncPulseCount = 5;
-        const scanLineCount = 4;
-        this.last5msSyncPulses = new Array(syncPulseCount).fill(0);
-        this.last9msSyncPulses = new Array(syncPulseCount).fill(0);
-        this.last20msSyncPulses = new Array(syncPulseCount).fill(0);
-        this.last5msScanLines = new Array(scanLineCount).fill(0);
-        this.last9msScanLines = new Array(scanLineCount).fill(0);
-        this.last20msScanLines = new Array(scanLineCount).fill(0);
-    }
-
-    /**
-     * Categorize modes by sync pulse width
-     */
-    private categorizeModesBySyncPulse(): {
-        pulse5ms: SSTVMode[];
-        pulse9ms: SSTVMode[];
-        pulse20ms: SSTVMode[];
-    } {
-        const pulse5ms: SSTVMode[] = [];
-        const pulse9ms: SSTVMode[] = [];
-        const pulse20ms: SSTVMode[] = [];
-
-        const allModes = getAllModes();
-
-        for (const mode of allModes) {
-            const syncMs = mode.syncPulse * 1000;
-
-            if (Math.abs(syncMs - 5) < 1) {
-                pulse5ms.push(mode);
-            } else if (Math.abs(syncMs - 9) < 1) {
-                pulse9ms.push(mode);
-            } else if (Math.abs(syncMs - 20) < 2) {
-                pulse20ms.push(mode);
-            }
-        }
-
-        return { pulse5ms, pulse9ms, pulse20ms };
+        // Initialize sync tracking using shared class
+        this.sync5ms = new SyncHistoryTracker();
+        this.sync9ms = new SyncHistoryTracker();
+        this.sync20ms = new SyncHistoryTracker();
     }
 
     /**
@@ -192,36 +160,29 @@ export class SSTVDecoder extends EventEmitter {
     private async checkVisCandidates(): Promise<void> {
         if (this.mode) return; // Mode already found
 
-        const visCodeBitSamples = Math.floor(0.03 * this.sampleRate);
-        const leaderToneSamples = Math.floor(0.3 * this.sampleRate);
-        const leaderToneToleranceSamples = Math.floor(0.06 * this.sampleRate);
-        const visCodeSamples = Math.floor(0.3 * this.sampleRate);
+        const requiredSamples = this.visDecoder.getRequiredSamples();
 
         // Iterate backwards to allow removing
         for (let i = this.visCandidates.length - 1; i >= 0; i--) {
             const candidate = this.visCandidates[i];
-            const requiredSamples = candidate.index + leaderToneSamples + leaderToneToleranceSamples + visCodeSamples;
 
-            if (this.currentSample >= requiredSamples) {
+            if (this.currentSample >= candidate.index + requiredSamples) {
                 // We have enough data, try to decode
-                const visMode = await this.tryDecodeVIS(candidate.index, candidate.freqOffset);
+                const visMode = this.visDecoder.tryDecodeFromDemodulated(
+                    this.scanLineBuffer,
+                    this.currentSample,
+                    candidate.index,
+                    candidate.freqOffset
+                );
                 if (visMode) {
                     this.mode = visMode;
                     this.emit('headerFound', candidate.index);
                     this.emit('modeDetected', this.mode, this.mode.id);
                     this.emit('decodingStarted', this.mode);
 
-                    const visDuration = 0.300;
-                    // Last sync pulse index points to the end of the VIS code (start of image data)
-                    // Sequence: Break (10ms) -> Leader (300ms) -> VIS (300ms)
-                    const breakSamples = Math.floor(CONST.CALIB_BREAK * this.sampleRate);
-                    const leaderSamples = Math.floor(CONST.CALIB_LEADER_2 * this.sampleRate);
-
                     // Set start point slightly back (0.1s) to ensure alignSync catches the first sync pulse
-                    // consistently. This prevents slanting on the first few lines.
                     const safetyMargin = Math.floor(0.1 * this.sampleRate);
-
-                    this.lastSyncPulseIndex = candidate.index + breakSamples + leaderSamples + Math.round(visDuration * this.sampleRate) - safetyMargin;
+                    this.lastSyncPulseIndex = this.visDecoder.calculateImageStartIndex(candidate.index) - safetyMargin;
 
                     this.currentScanLineSamples = Math.floor(this.mode.lineTime * this.sampleRate);
                     this.lastFrequencyOffset = candidate.freqOffset;
@@ -233,9 +194,6 @@ export class SSTVDecoder extends EventEmitter {
                     // Failed to decode, remove candidate
                     this.visCandidates.splice(i, 1);
                 }
-            } else {
-                // Not enough data yet, keep candidate
-                // Assuming candidates are ordered by index, earlier ones might be ready
             }
         }
     }
@@ -245,26 +203,22 @@ export class SSTVDecoder extends EventEmitter {
      */
     private async handleSyncPulse(width: SyncPulseWidth, index: number, freqOffset: number): Promise<void> {
         let modes: SSTVMode[];
-        let syncPulses: number[];
-        let scanLines: number[];
+        let syncTracker: SyncHistoryTracker;
 
         // Select appropriate arrays based on pulse width
         switch (width) {
             case SyncPulseWidth.FiveMilliSeconds:
                 modes = this.syncPulse5msModes;
-                syncPulses = this.last5msSyncPulses;
-                scanLines = this.last5msScanLines;
+                syncTracker = this.sync5ms;
                 break;
             case SyncPulseWidth.NineMilliSeconds:
                 modes = this.syncPulse9msModes;
-                syncPulses = this.last9msSyncPulses;
-                scanLines = this.last9msScanLines;
+                syncTracker = this.sync9ms;
                 this.leaderBreakIndex = index; // Could be VIS code
                 break;
             case SyncPulseWidth.TwentyMilliSeconds:
                 modes = this.syncPulse20msModes;
-                syncPulses = this.last20msSyncPulses;
-                scanLines = this.last20msScanLines;
+                syncTracker = this.sync20ms;
                 this.leaderBreakIndex = index; // Could be VIS code
                 break;
             default:
@@ -274,139 +228,31 @@ export class SSTVDecoder extends EventEmitter {
         // Try VIS code detection for 9ms and 20ms pulses
         if (width !== SyncPulseWidth.FiveMilliSeconds) {
             // Store potentially valid horizontal sync pulses (9ms for Robot36)
-            // We store all of them and filter during image reconstruction
             if (width === SyncPulseWidth.NineMilliSeconds && this.mode) {
                 this.detectedSyncPulses.push(index);
             }
 
-            // Queue potential VIS candidate to act on when enough data available
+            // Queue potential VIS candidate
             this.visCandidates.push({ index, freqOffset });
         }
 
-        // Update sync pulse history
-        this.updateSyncHistory(syncPulses, scanLines, index);
+        // Update sync pulse history using shared tracker
+        syncTracker.update(index, freqOffset);
 
         // Detect mode from scan line timing
-        const meanScanLine = this.calculateMean(scanLines);
-        const detectedMode = this.detectMode(modes, Math.round(meanScanLine));
+        const meanScanLine = calculateMean(syncTracker.scanLines);
+        const detectedMode = detectModeFromTiming(modes, Math.round(meanScanLine), this.sampleRate, this.scanLineToleranceSeconds);
 
         if (detectedMode && (!this.mode || detectedMode === this.mode)) {
             if (!this.mode) {
                 this.mode = detectedMode;
                 this.emit('modeDetected', this.mode, this.mode.id);
                 this.emit('decodingStarted', this.mode);
-                // Only set lastSyncPulseIndex when first detecting the mode
                 this.lastSyncPulseIndex = index;
             }
             this.currentScanLineSamples = Math.floor(this.mode.lineTime * this.sampleRate);
             this.lastFrequencyOffset = freqOffset;
         }
-    }
-
-    /**
-     * Update sync pulse history
-     */
-    private updateSyncHistory(syncPulses: number[], scanLines: number[], newIndex: number): void {
-        // Shift arrays
-        for (let i = 1; i < syncPulses.length; i++) {
-            syncPulses[i - 1] = syncPulses[i];
-        }
-        syncPulses[syncPulses.length - 1] = newIndex;
-
-        for (let i = 1; i < scanLines.length; i++) {
-            scanLines[i - 1] = scanLines[i];
-        }
-        scanLines[scanLines.length - 1] = syncPulses[syncPulses.length - 1] - syncPulses[syncPulses.length - 2];
-    }
-
-    /**
-     * Try to decode VIS code
-     */
-    private async tryDecodeVIS(breakIndex: number, freqOffset: number): Promise<SSTVMode | null> {
-        // Check if we have enough data for VIS code
-        const visCodeBitSamples = Math.floor(0.03 * this.sampleRate);
-        const leaderToneSamples = Math.floor(0.3 * this.sampleRate);
-        const breakSamples = Math.floor(CONST.CALIB_BREAK * this.sampleRate);
-        const leaderToneToleranceSamples = Math.floor(0.06 * this.sampleRate);
-        const visCodeSamples = Math.floor(0.3 * this.sampleRate);
-
-        if (breakIndex < visCodeBitSamples + leaderToneToleranceSamples) return null;
-        if (this.currentSample < breakIndex + leaderToneSamples + leaderToneToleranceSamples + visCodeSamples) {
-            return null;
-        }
-
-        // Check leader tone before break
-        let preBreakFreq = 0;
-        for (let i = 0; i < leaderToneToleranceSamples; i++) {
-            preBreakFreq += this.scanLineBuffer[breakIndex - visCodeBitSamples - leaderToneToleranceSamples + i];
-        }
-        preBreakFreq = this.denormalizeFrequency(preBreakFreq / leaderToneToleranceSamples);
-
-        if (Math.abs(preBreakFreq - CONST.FREQ_LEADER) > 100) return null;
-
-        // Decode VIS bits
-        const visBeginIndex = breakIndex + leaderToneSamples + breakSamples; // Keep breakSamples
-        const visBitFreqs: number[] = [];
-
-        for (let bit = 0; bit < 10; bit++) {
-            let freq = 0;
-            const start = visBeginIndex + bit * visCodeBitSamples + 5; // Skip transitions
-            const end = start + visCodeBitSamples - 10;
-            for (let i = start; i < end && i < this.currentSample; i++) {
-                freq += this.scanLineBuffer[i];
-            }
-            // Correct for frequency offset derived from calibration break/sync
-            freq = (freq / (visCodeBitSamples - 10)) - freqOffset;
-            freq = this.denormalizeFrequency(freq);
-            visBitFreqs.push(freq);
-        }
-
-        // Decode VIS code
-        let visCode = 0;
-        for (let i = 1; i < 9; i++) {
-            visCode |= (visBitFreqs[i] < 1250 ? 1 : 0) << (i - 1);
-        }
-        visCode &= 127;
-
-        // Find mode
-        return getModeByVIS(visCode);
-    }
-
-    /**
-     * Denormalize frequency from [-1, 1] to Hz
-     */
-    private denormalizeFrequency(normalized: number): number {
-        const scanLineBandwidth = CONST.FREQ_WHITE - CONST.FREQ_BLACK;
-        const centerFrequency = (1000 + 2800) / 2;
-        return normalized * scanLineBandwidth / 2 + centerFrequency;
-    }
-
-    /**
-     * Detect mode from scan line length
-     */
-    private detectMode(modes: SSTVMode[], scanLineSamples: number): SSTVMode | null {
-        const tolerance = Math.floor(this.scanLineToleranceSeconds * this.sampleRate);
-        let bestMode: SSTVMode | null = null;
-        let bestDist = Infinity;
-
-        for (const mode of modes) {
-            const expectedSamples = Math.floor(mode.lineTime * this.sampleRate);
-            const dist = Math.abs(scanLineSamples - expectedSamples);
-            if (dist <= tolerance && dist < bestDist) {
-                bestDist = dist;
-                bestMode = mode;
-            }
-        }
-
-        return bestMode;
-    }
-
-    /**
-     * Calculate mean of array
-     */
-    private calculateMean(arr: number[]): number {
-        if (arr.length === 0) return 0;
-        return arr.reduce((a, b) => a + b, 0) / arr.length;
     }
 
     /**
@@ -419,11 +265,15 @@ export class SSTVDecoder extends EventEmitter {
         this.lastSyncPulseIndex -= shift;
         this.leaderBreakIndex -= shift;
 
+        // Adjust sync trackers
+        this.sync5ms.adjustIndices(shift);
+        this.sync9ms.adjustIndices(shift);
+        this.sync20ms.adjustIndices(shift);
+
         // Adjust stored sync pulses
         for (let i = 0; i < this.detectedSyncPulses.length; i++) {
             this.detectedSyncPulses[i] -= shift;
         }
-        // Remove pulses that shifted out of buffer (negative index)
         this.detectedSyncPulses = this.detectedSyncPulses.filter(idx => idx >= 0);
     }
 
@@ -472,7 +322,7 @@ export class SSTVDecoder extends EventEmitter {
         }
 
         // Check if this is a PD mode (4 channels = Y-even, V, U, Y-odd)
-        const isPDMode = this.mode.channelCount === 4 && this.mode.colorFormat === ColorFormat.YCrCb;
+        const isPD = isPDMode(this.mode);
 
         const imageData: InternalImageData = {
             mode: this.mode,
@@ -488,7 +338,7 @@ export class SSTVDecoder extends EventEmitter {
         let seqStart = startSample;
 
         // Check if this is a Scottie-style mode (sync in the middle of line)
-        const hasMidSync = this.mode.syncChannel !== undefined && this.mode.syncChannel > 0;
+        const hasMidLineSync = hasMidSync(this.mode);
 
         // For modes with start sync, align to END of start sync
         if (this.mode.hasStartSync) {
@@ -498,7 +348,7 @@ export class SSTVDecoder extends EventEmitter {
             }
         }
 
-        if (isPDMode) {
+        if (isPD) {
             // PD modes: decode 2 lines per sync pulse
             // Each scan line contains: Y-even, V, U, Y-odd
             for (let linePair = 0; linePair < this.mode.height / 2; linePair++) {
@@ -561,7 +411,7 @@ export class SSTVDecoder extends EventEmitter {
                 imageData.linesDecoded = oddLine + 1;
                 this.emit('lineDecoded', oddLine, null, imageData);
             }
-        } else if (hasMidSync) {
+        } else if (hasMidLineSync) {
             // Scottie-style modes: sync is in the middle of the line (between Blue and Red)
             // For line 0 with hasStartSync, adjust seq_start backwards
             if (this.mode.hasStartSync && this.mode.syncChannel !== undefined) {
@@ -704,71 +554,5 @@ export class SSTVDecoder extends EventEmitter {
 }
 
 
-/**
- * Convert decoded SSTV image to RGB byte array
- * 
- * Optimized to minimize per-pixel calculations:
- * - Chroma interpolation is computed once per line for Robot 36
- * - Color conversion uses direct index calculation
- */
-export function imageDataToRGB(decoded: DecodedImage): Uint8Array {
-    const { mode, data, width, height } = decoded;
-    const rgb = new Uint8Array(width * height * 3);
-    const colorFormat = mode.colorFormat;
-    const channelCount = mode.channelCount;
-
-    for (let y = 0; y < height; y++) {
-        const lineOffset = y * width * 3;
-        const lineData = data[y];
-
-        if (colorFormat === ColorFormat.RGB) {
-            const ch0 = lineData[0];
-            const ch1 = lineData[1];
-            const ch2 = lineData[2];
-            for (let x = 0; x < width; x++) {
-                const idx = lineOffset + x * 3;
-                rgb[idx] = ch0[x];
-                rgb[idx + 1] = ch1[x];
-                rgb[idx + 2] = ch2[x];
-            }
-        } else if (colorFormat === ColorFormat.YCrCb) {
-            const yChannel = lineData[0];
-
-            if (channelCount === 2) {
-                // Robot 36: Compute chroma once per line (not per pixel!)
-                const chroma = interpolateChroma(y, height, data, width);
-                for (let x = 0; x < width; x++) {
-                    const idx = lineOffset + x * 3;
-                    const [r, g, b] = yuvToRgb(yChannel[x], chroma.u[x], chroma.v[x]);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
-                }
-            } else {
-                // Robot 72 (3 channels) and PD modes (4 channels)
-                // Both have: 0=Y, 1=V(Cr), 2=U(Cb)
-                const vChannel = lineData[1];
-                const uChannel = lineData[2];
-                for (let x = 0; x < width; x++) {
-                    const idx = lineOffset + x * 3;
-                    const [r, g, b] = yuvToRgb(yChannel[x], uChannel[x], vChannel[x]);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
-                }
-            }
-        } else if (colorFormat === ColorFormat.Grayscale) {
-            const grayChannel = lineData[0];
-            for (let x = 0; x < width; x++) {
-                const idx = lineOffset + x * 3;
-                const gray = grayChannel[x];
-                rgb[idx] = gray;
-                rgb[idx + 1] = gray;
-                rgb[idx + 2] = gray;
-            }
-        }
-    }
-
-    return rgb;
-}
-
+// Re-export imageDataToRGB from decoder-core for backwards compatibility
+export { imageDataToRGB } from './decoder-core';

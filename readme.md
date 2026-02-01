@@ -1,6 +1,6 @@
 # SSTV Encoder/Decoder
 
-A high-performance TypeScript library for encoding and decoding Slow Scan Television (SSTV) images. Supports multiple SSTV modes for amateur radio and image transmission.
+A TypeScript library for encoding and decoding Slow Scan Television (SSTV) images. Supports multiple SSTV modes for amateur radio and image transmission.
 
 ## Supported Modes
 
@@ -81,6 +81,49 @@ const encoder = new SSTVEncoder({
 // Provide image data (ImageData, Buffer, etc.)
 encoder.encode(imageData);
 // Output is a Float32Array of audio samples
+```
+
+### Streaming Decoder (for SDR applications)
+
+For real-time decoding from continuous audio sources like SDR streams:
+
+```js
+const { StreamingDecoder } = require("./dist");
+
+// Create streaming decoder
+const decoder = new StreamingDecoder({
+  sampleRate: 48000, // Your audio sample rate
+  maxBufferSeconds: 10, // Buffer size (default: 10s)
+  outputNoise: false, // Output lines even when no sync detected
+});
+
+// Listen for events
+decoder.on("modeDetected", (event) => {
+  console.log(`Mode: ${event.mode.name} (${event.method} detection)`);
+});
+
+decoder.on("line", (event) => {
+  console.log(`Line ${event.line + 1}/${event.height}`);
+  // event.pixels contains RGB data for this line
+  // Display or process the line in real-time
+});
+
+decoder.on("imageComplete", (event) => {
+  console.log(`Complete: ${event.image.width}x${event.image.height}`);
+  // event.rgbData contains the full RGB image
+  // Save or display the final image
+});
+
+// Feed audio chunks as they arrive from SDR
+sdrStream.on("data", (samples) => {
+  decoder.process(samples);
+});
+
+// When stream ends, flush remaining data
+const finalImage = decoder.flush();
+
+// Cancel if user closes app
+decoder.cancel();
 ```
 
 ### List Supported Modes
