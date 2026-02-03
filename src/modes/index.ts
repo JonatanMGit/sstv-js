@@ -3,21 +3,21 @@
  */
 
 import { SSTVMode } from '../types';
-import { MartinM1 } from './martin-m1';
-import { MartinM2 } from './martin-m2';
-import { ScottieS1 } from './scottie-s1';
-import { ScottieS2 } from './scottie-s2';
-import { ScottieDX } from './scottie-dx';
-import { Robot36 } from './robot-36';
-import { Robot72 } from './robot-72';
-import { Robot8BW } from './robot-8bw';
+
+// Base class
+import { BaseSSTVMode } from './base';
+
+// Mode implementations
+import { MartinM1, MartinM2 } from './martin-modes';
+import { ScottieS1, ScottieS2, ScottieDX } from './scottie-modes';
+import { Robot36, Robot72, Robot8BW } from './robot-modes';
 import { WraaseSC2180 } from './wraase-sc2-180';
 import { PD50, PD90, PD120, PD160, PD180, PD240, PD290 } from './pd-modes';
 
 /**
  * Registry of all supported SSTV modes
  */
-export const MODE_REGISTRY: Map<number, () => SSTVMode> = new Map([
+export const MODE_REGISTRY = new Map<number, () => SSTVMode>([
     // Martin modes
     [44, () => new MartinM1()],
     [40, () => new MartinM2()],
@@ -79,6 +79,9 @@ export function getAllModes(): SSTVMode[] {
 
 // Export all mode classes
 export {
+    // Base class for custom extensions
+    BaseSSTVMode,
+    // Concrete modes
     MartinM1,
     MartinM2,
     ScottieS1,

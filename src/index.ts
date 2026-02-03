@@ -54,6 +54,7 @@ export {
 export {
     SSTVMode,
     DecodedImage,
+    DecodedImageFlat,
     ImageData,
     DecoderOptions,
     EncoderOptions,
@@ -112,7 +113,9 @@ export {
     rgbToYCrCb,
     yCrCbToRgb,
     rgbToYUV,
-    yuvToRgb
+    yuvToRgb,
+    yuvToRgbInPlace,
+    rgbToYUVInPlace
 } from './utils/colorspace';
 
 // Frequency analysis
@@ -141,3 +144,33 @@ export {
     ShortTimeFourierTransform,
     SpectrogramRenderer
 } from './utils/spectrogram';
+
+// AGC and signal conditioning
+export {
+    AGC,
+    PeakLevelDetector
+} from './utils/agc';
+
+// Ring buffer for efficient streaming
+export {
+    RingBuffer,
+    MultiChannelRingBuffer
+} from './utils/ring-buffer';
+
+// Goertzel algorithm for efficient single-frequency detection
+export {
+    Goertzel,
+    GoertzelBank,
+    SlidingGoertzel
+} from './utils/goertzel';
+
+// Additional DSP filters
+export {
+    ExponentialMovingAverage,
+    FirstOrderLowPass,
+    FirstOrderHighPass,
+    DCBlocker,
+    PreEmphasis,
+    DeEmphasis,
+    MedianFilter
+} from './utils/filters';

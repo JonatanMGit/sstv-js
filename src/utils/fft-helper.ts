@@ -4,11 +4,16 @@
 
 import FFT from 'fft.js';
 
-// Cache for Hann window coefficients by size
+// LRU cache for Hann window coefficients by size
+// Limits memory growth when using dynamic window sizes
+const MAX_HANN_CACHE_SIZE = 20;
 const hannWindowCache = new Map<number, Float32Array>();
+const hannWindowLRU: number[] = [];
 
 /**
  * Generate or retrieve cached Hann window coefficients
+ * Uses LRU eviction when cache exceeds MAX_HANN_CACHE_SIZE
+ * 
  * @param size Window size
  * @returns Cached Float32Array with Hann window coefficients
  */
@@ -20,7 +25,24 @@ export function hannWindow(size: number): Float32Array {
         for (let i = 0; i < size; i++) {
             window[i] = 0.5 * (1 - Math.cos(factor * i));
         }
+
+        // LRU eviction if cache is full
+        if (hannWindowCache.size >= MAX_HANN_CACHE_SIZE) {
+            const oldest = hannWindowLRU.shift();
+            if (oldest !== undefined) {
+                hannWindowCache.delete(oldest);
+            }
+        }
+
         hannWindowCache.set(size, window);
+        hannWindowLRU.push(size);
+    } else {
+        // Move to end of LRU list (most recently used)
+        const idx = hannWindowLRU.indexOf(size);
+        if (idx !== -1) {
+            hannWindowLRU.splice(idx, 1);
+            hannWindowLRU.push(size);
+        }
     }
     return window;
 }

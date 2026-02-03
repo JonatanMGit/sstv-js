@@ -1,6 +1,14 @@
 /**
  * Color space conversion utilities
+ * 
+ * Provides both allocating and in-place conversion methods.
+ * Use in-place methods in hot paths for better performance.
  */
+
+// Pre-allocated result arrays for in-place conversion (thread-local style)
+// These are reused to avoid allocation in tight loops
+const _rgbResult = new Uint8Array(3);
+const _yuvResult = new Uint8Array(3);
 
 /**
  * Convert RGB to YCrCb (ITU-R BT.601)
@@ -76,6 +84,61 @@ export function yuvToRgb(y: number, u: number, v: number): [number, number, numb
         Math.max(0, Math.min(255, Math.round(g))),
         Math.max(0, Math.min(255, Math.round(b)))
     ];
+}
+
+/**
+ * In-place YUV to RGB conversion for hot paths
+ * Avoids tuple allocation overhead
+ * 
+ * @param y Y component (0-255)
+ * @param u U component (0-255)
+ * @param v V component (0-255)
+ * @param output Output buffer (at least 3 bytes)
+ * @param offset Starting offset in output buffer
+ */
+export function yuvToRgbInPlace(
+    y: number,
+    u: number,
+    v: number,
+    output: Uint8Array,
+    offset: number = 0
+): void {
+    const uOffset = u - 128;
+    const vOffset = v - 128;
+
+    const r = y + 1.402 * vOffset;
+    const g = y - 0.344136 * uOffset - 0.714136 * vOffset;
+    const b = y + 1.772 * uOffset;
+
+    output[offset] = Math.max(0, Math.min(255, Math.round(r)));
+    output[offset + 1] = Math.max(0, Math.min(255, Math.round(g)));
+    output[offset + 2] = Math.max(0, Math.min(255, Math.round(b)));
+}
+
+/**
+ * In-place RGB to YUV conversion for hot paths
+ */
+export function rgbToYUVInPlace(
+    r: number,
+    g: number,
+    b: number,
+    output: Uint8Array,
+    offset: number = 0
+): void {
+    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+    const v = 0.713 * (r - y) + 128;
+    const u = 0.564 * (b - y) + 128;
+
+    output[offset] = Math.max(0, Math.min(255, Math.round(y)));
+    output[offset + 1] = Math.max(0, Math.min(255, Math.round(v)));
+    output[offset + 2] = Math.max(0, Math.min(255, Math.round(u)));
+}
+
+/**
+ * Clamp value to byte range (0-255)
+ */
+export function clampByte(value: number): number {
+    return Math.max(0, Math.min(255, Math.round(value)));
 }
 
 /**

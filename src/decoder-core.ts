@@ -8,7 +8,7 @@
 import { SSTVMode, ColorFormat, DecodedImage } from './types';
 import { getAllModes, getModeByVIS } from './modes';
 import * as CONST from './constants';
-import { yuvToRgb, interpolateChroma } from './utils/colorspace';
+import { yuvToRgb, interpolateChroma, yuvToRgbInPlace } from './utils/colorspace';
 import { FFTPeakFinder } from './utils/fft-helper';
 
 /**
@@ -322,10 +322,31 @@ export class VISDecoder {
 
         // Parity should be even (false)
         if (parity) {
+            // Try single-bit error correction
+            const corrected = this.tryParityCorrection(visCode);
+            if (corrected !== null) {
+                return getModeByVIS(corrected);
+            }
             return null;
         }
 
         return getModeByVIS(visCode);
+    }
+
+    /**
+     * Attempt single-bit error correction when parity fails
+     * Tries flipping each bit to see if it produces a valid mode
+     */
+    private tryParityCorrection(originalCode: number): number | null {
+        for (let i = 0; i < 7; i++) {
+            const testCode = originalCode ^ (1 << i);
+            const mode = getModeByVIS(testCode);
+            if (mode) {
+                // Found a valid mode by flipping bit i
+                return testCode;
+            }
+        }
+        return null;
     }
 
     /**
@@ -406,6 +427,11 @@ export class VISDecoder {
 
         // Parity should be even (false)
         if (parity) {
+            // Try single-bit error correction
+            const corrected = this.tryParityCorrection(visCode);
+            if (corrected !== null) {
+                return getModeByVIS(corrected);
+            }
             return null;
         }
 
@@ -510,16 +536,14 @@ export class ImageChannelBuffer {
             if (channelCount === 2) {
                 // Robot 36: simplified chroma for streaming
                 const chromaChannel = this.channels[1];
+                const isEvenLine = line % 2 === 0;
                 for (let x = 0; x < width; x++) {
                     const idx = x * 3;
                     const srcIdx = line * width + x;
                     const y = yChannel[srcIdx];
-                    const u = line % 2 === 0 ? chromaChannel[srcIdx] : 128;
-                    const v = line % 2 === 1 ? chromaChannel[srcIdx] : 128;
-                    const [r, g, b] = yuvToRgb(y, u, v);
-                    output[idx] = r;
-                    output[idx + 1] = g;
-                    output[idx + 2] = b;
+                    const u = isEvenLine ? chromaChannel[srcIdx] : 128;
+                    const v = isEvenLine ? 128 : chromaChannel[srcIdx];
+                    yuvToRgbInPlace(y, u, v, output, idx);
                 }
             } else {
                 // Robot 72, PD modes: 0=Y, 1=V(Cr), 2=U(Cb)
@@ -528,10 +552,7 @@ export class ImageChannelBuffer {
                 for (let x = 0; x < width; x++) {
                     const idx = x * 3;
                     const srcIdx = line * width + x;
-                    const [r, g, b] = yuvToRgb(yChannel[srcIdx], uChannel[srcIdx], vChannel[srcIdx]);
-                    output[idx] = r;
-                    output[idx + 1] = g;
-                    output[idx + 2] = b;
+                    yuvToRgbInPlace(yChannel[srcIdx], uChannel[srcIdx], vChannel[srcIdx], output, idx);
                 }
             }
         } else if (colorFormat === ColorFormat.Grayscale) {
@@ -658,17 +679,20 @@ export class LinePixelDecoder {
         output: Uint8Array,
         outputOffset: number
     ): void {
+        const sampleRate = this.sampleRate;
+        const width = mode.width;
         const channelOffset = mode.getChannelOffset(line, channel);
-        const channelStart = syncPulseIndex + Math.floor(channelOffset * this.sampleRate);
+        const channelStart = syncPulseIndex + Math.floor(channelOffset * sampleRate);
         const scanTime = mode.getScanTime(line, channel);
 
-        const pixelTime = scanTime / mode.width;
-        const centerWindowTime = (pixelTime * mode.windowFactor) / 2;
-        const pixelWindow = Math.round(centerWindowTime * 2 * this.sampleRate);
+        // Hoist loop-invariant calculations
+        const pixelTimeSamples = (scanTime / width) * sampleRate;
+        const centerWindowSamples = (scanTime / width) * mode.windowFactor * 0.5 * sampleRate;
+        const pixelWindow = Math.round(centerWindowSamples * 2);
 
-        for (let pixel = 0; pixel < mode.width; pixel++) {
-            const centerPos = channelStart + (pixel * pixelTime) * this.sampleRate;
-            const windowStart = Math.floor(centerPos - centerWindowTime * this.sampleRate);
+        for (let pixel = 0; pixel < width; pixel++) {
+            const centerPos = channelStart + pixel * pixelTimeSamples;
+            const windowStart = Math.floor(centerPos - centerWindowSamples);
             const windowEnd = Math.min(windowStart + pixelWindow, bufferLength);
 
             if (windowEnd > windowStart && windowStart >= 0 && windowEnd <= bufferLength) {
@@ -694,30 +718,33 @@ export class LinePixelDecoder {
         sampleOffset: number = 0
     ): void {
         const width = mode.width;
+        const sampleRate = this.sampleRate;
         // Apply slant correction offset
         const correctedSyncIndex = syncPulseIndex + Math.round(sampleOffset);
 
         for (let ch = 0; ch < mode.channelCount; ch++) {
             const channelOffset = mode.getChannelOffset(line, ch);
-            const channelStart = correctedSyncIndex + Math.floor(channelOffset * this.sampleRate);
+            const channelStart = correctedSyncIndex + Math.floor(channelOffset * sampleRate);
             const scanTime = mode.getScanTime(line, ch);
 
-            const pixelTime = scanTime / width;
-            const centerWindowTime = (pixelTime * mode.windowFactor) / 2;
-            const pixelWindow = Math.round(centerWindowTime * 2 * this.sampleRate);
+            // Hoist loop-invariant calculations
+            const pixelTimeSamples = (scanTime / width) * sampleRate;
+            const centerWindowSamples = (scanTime / width) * mode.windowFactor * 0.5 * sampleRate;
+            const pixelWindow = Math.round(centerWindowSamples * 2);
+            const lineOffset = line * width;
+            const actualChannel = mode.channelOrder[ch];
+            const channelData = imageChannels[actualChannel];
 
             for (let pixel = 0; pixel < width; pixel++) {
-                const centerPos = channelStart + (pixel * pixelTime) * this.sampleRate;
-                const windowStart = Math.floor(centerPos - centerWindowTime * this.sampleRate);
+                const centerPos = channelStart + pixel * pixelTimeSamples;
+                const windowStart = Math.floor(centerPos - centerWindowSamples);
                 const windowEnd = Math.min(windowStart + pixelWindow, bufferLength);
 
                 if (windowEnd > windowStart && windowStart >= 0 && windowEnd <= bufferLength) {
                     const audioWindow = sampleBuffer.subarray(windowStart, windowEnd);
                     const peakFreq = this.fftPeakFinder.findPeakFrequency(audioWindow);
                     const value = FFTPeakFinder.frequencyToPixel(peakFreq);
-
-                    const actualChannel = mode.channelOrder[ch];
-                    imageChannels[actualChannel][line * width + pixel] = value;
+                    channelData[lineOffset + pixel] = value;
                 }
             }
         }
@@ -737,22 +764,30 @@ export class LinePixelDecoder {
         sampleOffset: number = 0
     ): void {
         const width = mode.width;
+        const sampleRate = this.sampleRate;
         const oddLine = evenLine + 1;
         // Apply slant correction offset
         const correctedSyncIndex = syncPulseIndex + Math.round(sampleOffset);
+        // Pre-compute line offsets
+        const evenOffset = evenLine * width;
+        const oddOffset = oddLine * width;
+        const ch0 = imageChannels[0];
+        const ch1 = imageChannels[1];
+        const ch2 = imageChannels[2];
 
         for (let ch = 0; ch < 4; ch++) {
             const channelOffset = mode.getChannelOffset(evenLine, ch);
-            const channelStart = correctedSyncIndex + Math.floor(channelOffset * this.sampleRate);
+            const channelStart = correctedSyncIndex + Math.floor(channelOffset * sampleRate);
             const scanTime = mode.getScanTime(evenLine, ch);
 
-            const pixelTime = scanTime / width;
-            const centerWindowTime = (pixelTime * mode.windowFactor) / 2;
-            const pixelWindow = Math.round(centerWindowTime * 2 * this.sampleRate);
+            // Hoist loop-invariant calculations
+            const pixelTimeSamples = (scanTime / width) * sampleRate;
+            const centerWindowSamples = (scanTime / width) * mode.windowFactor * 0.5 * sampleRate;
+            const pixelWindow = Math.round(centerWindowSamples * 2);
 
             for (let pixel = 0; pixel < width; pixel++) {
-                const centerPos = channelStart + (pixel * pixelTime) * this.sampleRate;
-                const windowStart = Math.floor(centerPos - centerWindowTime * this.sampleRate);
+                const centerPos = channelStart + pixel * pixelTimeSamples;
+                const windowStart = Math.floor(centerPos - centerWindowSamples);
                 const windowEnd = Math.min(windowStart + pixelWindow, bufferLength);
 
                 if (windowEnd > windowStart && windowStart >= 0 && windowEnd <= bufferLength) {
@@ -762,15 +797,15 @@ export class LinePixelDecoder {
 
                     // PD channel layout: 0=Y-even, 1=V, 2=U, 3=Y-odd
                     if (ch === 0) {
-                        imageChannels[0][evenLine * width + pixel] = value;
+                        ch0[evenOffset + pixel] = value;
                     } else if (ch === 1) {
-                        imageChannels[1][evenLine * width + pixel] = value;
-                        imageChannels[1][oddLine * width + pixel] = value;
+                        ch1[evenOffset + pixel] = value;
+                        ch1[oddOffset + pixel] = value;
                     } else if (ch === 2) {
-                        imageChannels[2][evenLine * width + pixel] = value;
-                        imageChannels[2][oddLine * width + pixel] = value;
-                    } else if (ch === 3) {
-                        imageChannels[0][oddLine * width + pixel] = value;
+                        ch2[evenOffset + pixel] = value;
+                        ch2[oddOffset + pixel] = value;
+                    } else {
+                        ch0[oddOffset + pixel] = value;
                     }
                 }
             }
@@ -825,10 +860,7 @@ export function imageDataToRGB(decoded: DecodedImage): Uint8Array {
                 const chroma = interpolateChroma(y, height, data, width);
                 for (let x = 0; x < width; x++) {
                     const idx = lineOffset + x * 3;
-                    const [r, g, b] = yuvToRgb(yChannel[x], chroma.u[x], chroma.v[x]);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
+                    yuvToRgbInPlace(yChannel[x], chroma.u[x], chroma.v[x], rgb, idx);
                 }
             } else {
                 // Robot 72, PD modes: 0=Y, 1=V(Cr), 2=U(Cb)
@@ -836,10 +868,7 @@ export function imageDataToRGB(decoded: DecodedImage): Uint8Array {
                 const uChannel = lineData[2];
                 for (let x = 0; x < width; x++) {
                     const idx = lineOffset + x * 3;
-                    const [r, g, b] = yuvToRgb(yChannel[x], uChannel[x], vChannel[x]);
-                    rgb[idx] = r;
-                    rgb[idx + 1] = g;
-                    rgb[idx + 2] = b;
+                    yuvToRgbInPlace(yChannel[x], uChannel[x], vChannel[x], rgb, idx);
                 }
             }
         } else if (colorFormat === ColorFormat.Grayscale) {

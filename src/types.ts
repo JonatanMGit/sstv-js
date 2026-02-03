@@ -91,8 +91,22 @@ export interface SSTVMode {
 /**
  * Image data structure - 3D array [line][channel][pixel]
  * Each pixel value is 0-255 representing brightness or color component
+ * @deprecated Use RGBImageData for better performance
  */
 export type ImageData = readonly (readonly (readonly number[])[])[];
+
+/**
+ * Flat RGB image data with explicit dimensions
+ * More efficient than nested arrays - avoids allocation overhead
+ */
+export interface RGBImageData {
+    /** Raw RGB pixel data (width * height * 3 bytes, row-major order) */
+    readonly pixels: Uint8Array;
+    /** Image width in pixels */
+    readonly width: number;
+    /** Image height in pixels */
+    readonly height: number;
+}
 
 /**
  * Decoded SSTV image result
@@ -109,6 +123,27 @@ export interface DecodedImage {
     /** Lines successfully decoded (may be less than height for incomplete signals) */
     readonly linesDecoded: number;
     /** Slant correction factor applied (1.0 = no correction) */
+    readonly slantCorrection: number;
+}
+
+/**
+ * Efficient decoded image using flat TypedArrays
+ * Preferred over DecodedImage for performance-critical applications
+ */
+export interface DecodedImageFlat {
+    /** Mode used for decoding */
+    readonly mode: SSTVMode;
+    /** Raw channel data (channelCount arrays of width * height bytes each) */
+    readonly channels: readonly Uint8Array[];
+    /** RGB pixel data (width * height * 3 bytes) */
+    readonly rgb: Uint8Array;
+    /** Image width in pixels */
+    readonly width: number;
+    /** Image height in pixels */
+    readonly height: number;
+    /** Lines successfully decoded */
+    readonly linesDecoded: number;
+    /** Slant correction factor applied */
     readonly slantCorrection: number;
 }
 

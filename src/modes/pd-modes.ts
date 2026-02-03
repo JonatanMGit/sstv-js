@@ -1,13 +1,13 @@
 /**
- * PD Mode Base Class
+ * PD Modes
+ * 
  * PD modes transmit 2 lines of Y for every 1 line of chroma
  * Structure: Sync -> Porch -> Y(odd) -> R-Y -> B-Y -> Y(even)
  */
 
-import { ColorFormat, ChromaSubsampling } from '../types';
-import { BaseSSTVMode } from './base';
+import { ColorFormat, ChromaSubsampling, SSTVMode } from '../types';
 
-export abstract class PDMode extends BaseSSTVMode {
+abstract class PDMode implements SSTVMode {
     colorFormat = ColorFormat.YCrCb;
     chromaSubsampling = ChromaSubsampling.Quarter; // 4:2:0
 
@@ -15,19 +15,22 @@ export abstract class PDMode extends BaseSSTVMode {
     syncPorch = 0.00208;
 
     channelCount = 4; // Y(odd), R-Y, B-Y, Y(even)
-    channelOrder = [0, 1, 2, 0]; // Y, Cr, Cb, Y
+    channelOrder: readonly number[] = [0, 1, 2, 0]; // Y, Cr, Cb, Y
 
-    abstract scanTime: number; // All components have same scan time in PD modes
+    abstract readonly id: number;
+    abstract readonly name: string;
+    abstract readonly width: number;
+    abstract readonly height: number;
+    abstract readonly scanTime: number; // All components have same scan time in PD modes
+    abstract readonly windowFactor: number;
 
-    get scanTimes(): number[] {
+    get scanTimes(): readonly number[] {
         return [this.scanTime, this.scanTime, this.scanTime, this.scanTime];
     }
 
-    get separatorPulses(): number[] {
+    get separatorPulses(): readonly number[] {
         return [0, 0, 0, 0]; // No separators in PD modes
     }
-
-    abstract windowFactor: number;
 
     hasStartSync = false;
 
@@ -43,6 +46,10 @@ export abstract class PDMode extends BaseSSTVMode {
         }
         return offset;
     }
+
+    getScanTime(line: number, channel: number): number {
+        return this.scanTime;
+    }
 }
 
 /**
@@ -50,12 +57,12 @@ export abstract class PDMode extends BaseSSTVMode {
  * 320x256 YCrCb 4:2:0
  */
 export class PD50 extends PDMode {
-    id = 93;
-    name = 'PD 50';
-    width = 320;
-    height = 256;
-    scanTime = 0.09152;
-    windowFactor = 3.7;
+    readonly id = 93;
+    readonly name = 'PD 50';
+    readonly width = 320;
+    readonly height = 256;
+    readonly scanTime = 0.09152;
+    readonly windowFactor = 3.7;
 }
 
 /**
@@ -63,12 +70,12 @@ export class PD50 extends PDMode {
  * 320x256 YCrCb 4:2:0
  */
 export class PD90 extends PDMode {
-    id = 99;
-    name = 'PD 90';
-    width = 320;
-    height = 256;
-    scanTime = 0.17024;
-    windowFactor = 2.0;
+    readonly id = 99;
+    readonly name = 'PD 90';
+    readonly width = 320;
+    readonly height = 256;
+    readonly scanTime = 0.17024;
+    readonly windowFactor = 2.0;
 }
 
 /**
@@ -76,12 +83,12 @@ export class PD90 extends PDMode {
  * 640x496 YCrCb 4:2:0
  */
 export class PD120 extends PDMode {
-    id = 95;
-    name = 'PD 120';
-    width = 640;
-    height = 496;
-    scanTime = 0.12160;
-    windowFactor = 5.6;
+    readonly id = 95;
+    readonly name = 'PD 120';
+    readonly width = 640;
+    readonly height = 496;
+    readonly scanTime = 0.12160;
+    readonly windowFactor = 5.6;
 }
 
 /**
@@ -89,12 +96,12 @@ export class PD120 extends PDMode {
  * 512x400 YCrCb 4:2:0
  */
 export class PD160 extends PDMode {
-    id = 98;
-    name = 'PD 160';
-    width = 512;
-    height = 400;
-    scanTime = 0.195584;
-    windowFactor = 2.8;
+    readonly id = 98;
+    readonly name = 'PD 160';
+    readonly width = 512;
+    readonly height = 400;
+    readonly scanTime = 0.195584;
+    readonly windowFactor = 2.8;
 }
 
 /**
@@ -102,12 +109,12 @@ export class PD160 extends PDMode {
  * 640x496 YCrCb 4:2:0
  */
 export class PD180 extends PDMode {
-    id = 96;
-    name = 'PD 180';
-    width = 640;
-    height = 496;
-    scanTime = 0.18304;
-    windowFactor = 3.7;
+    readonly id = 96;
+    readonly name = 'PD 180';
+    readonly width = 640;
+    readonly height = 496;
+    readonly scanTime = 0.18304;
+    readonly windowFactor = 3.7;
 }
 
 /**
@@ -115,12 +122,12 @@ export class PD180 extends PDMode {
  * 640x496 YCrCb 4:2:0
  */
 export class PD240 extends PDMode {
-    id = 97;
-    name = 'PD 240';
-    width = 640;
-    height = 496;
-    scanTime = 0.24448;
-    windowFactor = 2.8;
+    readonly id = 97;
+    readonly name = 'PD 240';
+    readonly width = 640;
+    readonly height = 496;
+    readonly scanTime = 0.24448;
+    readonly windowFactor = 2.8;
 }
 
 /**
@@ -128,10 +135,10 @@ export class PD240 extends PDMode {
  * 800x616 YCrCb 4:2:0
  */
 export class PD290 extends PDMode {
-    id = 94;
-    name = 'PD 290';
-    width = 800;
-    height = 616;
-    scanTime = 0.22880;
-    windowFactor = 3.7;
+    readonly id = 94;
+    readonly name = 'PD 290';
+    readonly width = 800;
+    readonly height = 616;
+    readonly scanTime = 0.22880;
+    readonly windowFactor = 3.7;
 }

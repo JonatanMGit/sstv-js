@@ -17,9 +17,9 @@ export abstract class BaseSSTVMode implements SSTVMode {
     abstract syncPulse: number;
     abstract syncPorch: number;
     abstract channelCount: number;
-    abstract channelOrder: number[];
-    abstract scanTimes: number[];
-    abstract separatorPulses: number[];
+    abstract channelOrder: readonly number[];
+    abstract scanTimes: readonly number[];
+    abstract separatorPulses: readonly number[];
     abstract lineTime: number;
     abstract hasStartSync: boolean;
     abstract windowFactor: number;
