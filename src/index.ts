@@ -135,3 +135,9 @@ export {
     SimpleMovingAverage,
     SchmittTrigger
 } from './utils/dsp';
+
+// Spectrogram/STFT utilities for visualization
+export {
+    ShortTimeFourierTransform,
+    SpectrogramRenderer
+} from './utils/spectrogram';

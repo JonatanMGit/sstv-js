@@ -74,6 +74,9 @@ export interface StreamingDecoderOptions {
 
     /** Whether to output raw/noise lines when no sync is detected (default: true) */
     outputNoise?: boolean;
+
+    /** Whether to allow VIS detection to interrupt the current mode (useful if forcing a mode for noise visualization) */
+    allowVisInterrupt?: boolean;
 }
 
 /**
@@ -163,6 +166,7 @@ export class StreamingDecoder extends EventEmitter {
     private readonly maxBufferSamples: number;
     private readonly outputNoise: boolean;
     private readonly forcedMode: number | undefined;
+    private readonly allowVisInterrupt: boolean;
 
     // Audio buffer (ring buffer style, but we use shift for simplicity)
     private sampleBuffer: Float32Array;
@@ -189,6 +193,13 @@ export class StreamingDecoder extends EventEmitter {
     private currentScanLineSamples: number = 0;
     private lastFrequencyOffset: number = 0;
     private cancelled: boolean = false;
+    private imageCompleted: boolean = false;  // True after image complete, blocks decoding until new VIS
+
+    // Slant correction tracking
+    private expectedScanLineSamples: number = 0;  // Theoretical line length from mode
+    private cumulativeDrift: number = 0;          // Accumulated sample drift
+    private syncPositions: number[] = [];          // Actual sync positions for post-process correction
+    private driftPerLine: number = 0;             // Calculated drift rate (samples per line)
 
     // Image data (using shared class)
     private readonly imageBuffer: ImageChannelBuffer;
@@ -211,6 +222,7 @@ export class StreamingDecoder extends EventEmitter {
         this.sampleRate = options.sampleRate;
         this.maxBufferSamples = Math.floor((options.maxBufferSeconds ?? 10) * this.sampleRate);
         this.outputNoise = options.outputNoise ?? true;
+        this.allowVisInterrupt = options.allowVisInterrupt ?? false;
         this.forcedMode = options.forceMode;
 
         // Allocate sample buffer
@@ -307,17 +319,20 @@ export class StreamingDecoder extends EventEmitter {
         }
 
         // Handle sync pulse detection
+        let syncHandled = false;
         if (result.syncPulseDetected && result.syncPulseWidth !== undefined) {
             const syncPulseIndex = this.bufferWritePos + (result.syncPulseOffset || 0) - samples.length;
             this.handleSyncPulse(result.syncPulseWidth, syncPulseIndex, result.frequencyOffset || 0);
+            // When sync is detected, processSyncPulse handles decoding - don't also run timing-based
+            syncHandled = true;
         }
 
         // Check VIS candidates
         this.checkVisCandidates();
 
-        // If we have a mode, decode lines based on expected timing when we have enough samples
-        // This handles both sync pulse fallback AND noise passthrough
-        if (this.currentMode && this.imageBuffer.linesDecoded < this.currentMode.height) {
+        // If we have a mode and sync wasn't detected, decode lines based on expected timing
+        // This is a fallback for when sync pulses are missed
+        if (!syncHandled && this.currentMode && this.imageBuffer.linesDecoded < this.imageBuffer.getMaxLines()) {
             this.decodeLinesByTiming();
         }
 
@@ -393,13 +408,30 @@ export class StreamingDecoder extends EventEmitter {
             if (detectedMode) {
                 this.setMode(detectedMode, 'timing');
                 modeChanged = true;
+                // Initialize slant tracking
+                this.expectedScanLineSamples = Math.floor(detectedMode.lineTime * this.sampleRate);
+                this.cumulativeDrift = 0;
+                this.syncPositions = [];
+                this.driftPerLine = 0;
             }
         } else {
-            // Verify scan line matches current mode
+            // Verify scan line matches current mode within tolerance
             if (Math.abs(scanLineSamples - this.currentScanLineSamples) > this.scanLineToleranceSamples) {
                 return;
             }
+
+            // Track drift: difference between measured and expected line length
+            // Positive drift = lines are longer than expected = slant to the right
+            const lineDrift = scanLineSamples - this.expectedScanLineSamples;
+            this.cumulativeDrift += lineDrift;
+
+            // Update drift rate using exponential moving average
+            const alpha = 0.1;
+            this.driftPerLine = this.driftPerLine * (1 - alpha) + lineDrift * alpha;
         }
+
+        // Store sync position for post-process slant correction
+        this.syncPositions.push(latestSyncIndex);
 
         // Calculate frequency offset mean
         const frequencyOffset = calculateMean(syncTracker.freqOffsets);
@@ -435,7 +467,7 @@ export class StreamingDecoder extends EventEmitter {
      * Check pending VIS candidates
      */
     private checkVisCandidates(): void {
-        if (this.currentMode) return; // Mode already found
+        if (this.currentMode && !this.allowVisInterrupt) return; // Mode already found
 
         const requiredSamples = this.visDecoder.getRequiredSamples();
 
@@ -452,6 +484,22 @@ export class StreamingDecoder extends EventEmitter {
                     candidate.freqOffset
                 );
                 if (mode) {
+                    // If we're already decoding an image (more than 10% complete), 
+                    // don't switch modes unless it's the same mode type (same sync pulse width)
+                    if (this.currentMode && this.imageBuffer.linesDecoded > 0) {
+                        const currentProgress = this.imageBuffer.linesDecoded / this.currentMode.height;
+                        if (currentProgress > 0.1) {
+                            // Only allow switching if syncs match
+                            const currentSyncMs = this.currentMode.syncPulse * 1000;
+                            const newSyncMs = mode.syncPulse * 1000;
+                            if (Math.abs(currentSyncMs - newSyncMs) > 5) {
+                                // Different sync type - ignore this VIS detection
+                                this.visCandidates.splice(i, 1);
+                                continue;
+                            }
+                        }
+                    }
+
                     this.setMode(mode, 'vis');
                     this.visCandidates = [];
 
@@ -503,6 +551,13 @@ export class StreamingDecoder extends EventEmitter {
     private setMode(mode: SSTVMode, method: 'vis' | 'timing'): void {
         this.currentMode = mode;
         this.currentScanLineSamples = Math.floor(mode.lineTime * this.sampleRate);
+        this.imageCompleted = false;  // Clear complete flag - ready to decode new image
+
+        // Initialize slant correction tracking
+        this.expectedScanLineSamples = this.currentScanLineSamples;
+        this.cumulativeDrift = 0;
+        this.syncPositions = [];
+        this.driftPerLine = 0;
 
         // Allocate image channels using shared buffer
         this.imageBuffer.allocate(mode);
@@ -523,7 +578,9 @@ export class StreamingDecoder extends EventEmitter {
      */
     private decodeLineAt(syncPulseIndex: number, scanLineSamples: number, isNoise: boolean): void {
         if (!this.currentMode) return;
-        if (this.imageBuffer.linesDecoded >= this.currentMode.height) return;
+        if (this.imageCompleted) return;  // Wait for new VIS code before decoding more lines
+        // Allow decoding past mode.height up to buffer capacity (for non-standard encoders)
+        if (this.imageBuffer.linesDecoded >= this.imageBuffer.getMaxLines()) return;
         if (syncPulseIndex < 0 || syncPulseIndex + scanLineSamples > this.bufferWritePos) return;
 
         const mode = this.currentMode;
@@ -559,7 +616,8 @@ export class StreamingDecoder extends EventEmitter {
 
         // Decode each complete line
         for (let i = 0; i < linesToDecode; i++) {
-            if (this.imageBuffer.linesDecoded >= this.currentMode.height) break;
+            // Allow decoding past mode.height up to buffer capacity
+            if (this.imageBuffer.linesDecoded >= this.imageBuffer.getMaxLines()) break;
 
             const lineStartIndex = this.lastSyncPulseIndex + i * this.currentScanLineSamples;
             const lineEndIndex = lineStartIndex + this.currentScanLineSamples;
@@ -592,6 +650,10 @@ export class StreamingDecoder extends EventEmitter {
         const width = mode.width;
         const channels = this.imageBuffer.getChannels();
 
+        // No real-time slant correction during live preview (like Robot36)
+        // Slant is corrected in post-process when building final image
+        const slantCorrection = 0;
+
         // Decode each channel using shared line decoder
         this.lineDecoder.decodeStandardLine(
             this.sampleBuffer,
@@ -599,16 +661,15 @@ export class StreamingDecoder extends EventEmitter {
             mode,
             line,
             syncPulseIndex,
-            channels
+            channels,
+            slantCorrection
         );
 
         this.imageBuffer.linesDecoded++;
         this.emitLine(line, isNoise);
 
-        // Check if image is complete
-        if (this.imageBuffer.linesDecoded >= mode.height) {
-            this.emitImageComplete();
-        }
+        // Don't auto-complete at mode.height - allow extra lines
+        // Image complete is triggered by new VIS code or flush()
     }
 
     /**
@@ -621,9 +682,14 @@ export class StreamingDecoder extends EventEmitter {
         const evenLine = linePair;
         const oddLine = linePair + 1;
 
-        if (oddLine >= mode.height) return;
+        // Check against buffer capacity, not mode.height (allow extra lines)
+        if (oddLine >= this.imageBuffer.getMaxLines()) return;
 
         const channels = this.imageBuffer.getChannels();
+
+        // No real-time slant correction during live preview (like Robot36)
+        // Slant is corrected in post-process when building final image
+        const slantCorrection = 0;
 
         // Decode PD line pair using shared line decoder
         this.lineDecoder.decodePDLinePair(
@@ -632,17 +698,16 @@ export class StreamingDecoder extends EventEmitter {
             mode,
             evenLine,
             syncPulseIndex,
-            channels
+            channels,
+            slantCorrection
         );
 
         this.imageBuffer.linesDecoded += 2;
         this.emitLine(evenLine, isNoise);
         this.emitLine(oddLine, isNoise);
 
-        // Check if image is complete
-        if (this.imageBuffer.linesDecoded >= mode.height) {
-            this.emitImageComplete();
-        }
+        // Don't auto-complete at mode.height - allow extra lines
+        // Image complete is triggered by new VIS code or flush()
     }
 
     /**
@@ -677,8 +742,11 @@ export class StreamingDecoder extends EventEmitter {
 
         const mode = this.currentMode;
 
-        // Build RGB data using shared buffer
-        const rgbData = this.imageBuffer.toRGB();
+        // Build RGB data using shared buffer (with post-process slant correction)
+        let rgbData = this.imageBuffer.toRGB();
+
+        // Apply MMSSTV-style high-accuracy post-process slant correction
+        rgbData = this.applyHighAccuracySlantCorrection(rgbData);
 
         // Build DecodedImage using shared buffer
         const image = this.imageBuffer.toDecodedImage();
@@ -690,18 +758,29 @@ export class StreamingDecoder extends EventEmitter {
             } as ImageCompleteEvent);
         }
 
-        // Reset for next image
+        // Reset for next image - keep mode, just reset image buffer (like Robot36)
         this.resetForNextImage();
     }
 
     /**
-     * Reset decoder for next image (keeps mode)
+     * Reset decoder for next image (waits for new VIS like Robot36)
      */
     private resetForNextImage(): void {
-        if (this.currentMode) {
-            // Reset image buffer using shared class
-            this.imageBuffer.reset();
-        }
+        // Mark image as complete - block further decoding until new VIS
+        this.imageCompleted = true;
+
+        // Reset slant tracking for fresh image
+        this.cumulativeDrift = 0;
+        this.syncPositions = [];
+        this.driftPerLine = 0;
+
+        // Reset image buffer but keep mode
+        this.imageBuffer.reset();
+
+        // Reset sync trackers to avoid stale data for new image
+        this.sync5ms.reset();
+        this.sync9ms.reset();
+        this.sync20ms.reset();
 
         this.emit('reset');
     }
@@ -764,9 +843,9 @@ export class StreamingDecoder extends EventEmitter {
         }
 
         // Try to decode any remaining lines with whatever data we have
-        if (this.currentScanLineSamples > 0 && this.imageBuffer.linesDecoded < this.currentMode.height) {
+        if (this.currentScanLineSamples > 0 && this.imageBuffer.linesDecoded < this.imageBuffer.getMaxLines()) {
             // Decode remaining lines even if we don't have full scan line length
-            while (this.imageBuffer.linesDecoded < this.currentMode.height) {
+            while (this.imageBuffer.linesDecoded < this.imageBuffer.getMaxLines()) {
                 const lineStartIndex = this.lastSyncPulseIndex;
                 const availableSamples = this.bufferWritePos - lineStartIndex;
 
@@ -784,13 +863,8 @@ export class StreamingDecoder extends EventEmitter {
             }
         }
 
-        // If we have a complete image, return it
-        if (this.imageBuffer.linesDecoded >= this.currentMode.height) {
-            return this.buildImageCompleteEvent();
-        }
-
-        // If we have partial data (at least 50%), return it
-        if (this.imageBuffer.linesDecoded > 0 && this.imageBuffer.linesDecoded >= this.currentMode.height * 0.5) {
+        // Return image if we have at least some decoded lines
+        if (this.imageBuffer.linesDecoded > 0) {
             return this.buildImageCompleteEvent();
         }
 
@@ -798,12 +872,72 @@ export class StreamingDecoder extends EventEmitter {
     }
 
     /**
+     * Apply high-accuracy slant correction using cumulative drift
+     * Similar to MMSSTV's CorrectSlant function
+     */
+    private applyHighAccuracySlantCorrection(rgbData: Uint8Array): Uint8Array {
+        if (!this.currentMode) {
+            return rgbData;
+        }
+
+        const width = this.currentMode.width;
+        const height = this.imageBuffer.linesDecoded;
+
+        // If we don't have drift data, skip correction
+        if (this.expectedScanLineSamples === 0 || height < 3) {
+            return rgbData;
+        }
+
+        // Calculate drift rate: how many samples we're off per line
+        // driftPerLine is already an EMA of the per-line drift
+        // Convert to pixels: (drift_in_samples / samples_per_line) * width
+        const driftRatio = this.driftPerLine / this.expectedScanLineSamples;
+        const pixelsPerLine = driftRatio * width;
+
+        // If slant is negligible, don't bother correcting
+        if (Math.abs(pixelsPerLine) < 0.1) {
+            return rgbData;
+        }
+
+        // Create corrected image by shifting each line
+        const correctedData = new Uint8Array(rgbData.length);
+
+        for (let y = 0; y < height; y++) {
+            const lineOffset = y * width * 3;
+            const shift = Math.round(y * pixelsPerLine);
+
+            for (let x = 0; x < width; x++) {
+                const srcX = x + shift;
+                const dstIdx = lineOffset + x * 3;
+
+                // Handle wrapping
+                let actualSrcX = srcX;
+                if (actualSrcX < 0) {
+                    actualSrcX = ((actualSrcX % width) + width) % width;
+                } else if (actualSrcX >= width) {
+                    actualSrcX = actualSrcX % width;
+                }
+
+                const srcIdx = lineOffset + actualSrcX * 3;
+                correctedData[dstIdx] = rgbData[srcIdx];
+                correctedData[dstIdx + 1] = rgbData[srcIdx + 1];
+                correctedData[dstIdx + 2] = rgbData[srcIdx + 2];
+            }
+        }
+
+        return correctedData;
+    }
+
+    /**
      * Build an ImageCompleteEvent from current state
      */
     private buildImageCompleteEvent(): ImageCompleteEvent {
         // Use shared buffer methods
-        const rgbData = this.imageBuffer.toRGB();
+        let rgbData = this.imageBuffer.toRGB();
         const image = this.imageBuffer.toDecodedImage()!;
+
+        // Apply high-accuracy slant correction
+        rgbData = this.applyHighAccuracySlantCorrection(rgbData);
 
         return {
             image,
@@ -824,12 +958,19 @@ export class StreamingDecoder extends EventEmitter {
     reset(): void {
         this.cancelled = false;
         this.currentMode = null;
+        this.imageCompleted = false;
         this.bufferWritePos = 0;
         this.lastSyncPulseIndex = 0;
         this.currentScanLineSamples = 0;
         this.lastFrequencyOffset = 0;
         this.leaderBreakIndex = 0;
         this.visCandidates = [];
+
+        // Reset slant correction tracking
+        this.expectedScanLineSamples = 0;
+        this.cumulativeDrift = 0;
+        this.syncPositions = [];
+        this.driftPerLine = 0;
 
         // Reset image buffer
         this.imageBuffer.reset();

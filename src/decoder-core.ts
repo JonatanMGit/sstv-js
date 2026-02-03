@@ -291,12 +291,39 @@ export class VISDecoder {
             visBitFreqs.push(freq);
         }
 
-        // Decode VIS code
-        let visCode = 0;
-        for (let i = 1; i < 9; i++) {
-            visCode |= (visBitFreqs[i] < 1250 ? 1 : 0) << (i - 1);
+        // Validate start bit (bit 0) and stop bit (bit 9) - should be ~1200 Hz
+        const startBitTolerance = 100;
+        if (Math.abs(visBitFreqs[0] - 1200) > startBitTolerance ||
+            Math.abs(visBitFreqs[9] - 1200) > startBitTolerance) {
+            return null;
         }
-        visCode &= 127;
+
+        // Validate data bits - should be either ~1100 Hz (1) or ~1300 Hz (0)
+        const dataBitTolerance = 100;
+        for (let i = 1; i <= 8; i++) {
+            const freq = visBitFreqs[i];
+            if (Math.abs(freq - 1100) > dataBitTolerance && Math.abs(freq - 1300) > dataBitTolerance) {
+                return null;
+            }
+        }
+
+        // Decode VIS code with parity validation
+        let visCode = 0;
+        let parity = false;
+        for (let i = 1; i <= 7; i++) {
+            const bit = visBitFreqs[i] < 1250 ? 1 : 0;
+            visCode |= bit << (i - 1);
+            if (bit) parity = !parity;
+        }
+
+        // Bit 8 is parity bit (even parity)
+        const parityBit = visBitFreqs[8] < 1250 ? 1 : 0;
+        if (parityBit) parity = !parity;
+
+        // Parity should be even (false)
+        if (parity) {
+            return null;
+        }
 
         return getModeByVIS(visCode);
     }
@@ -348,12 +375,39 @@ export class VISDecoder {
             visBitFreqs.push(freq);
         }
 
-        // Decode VIS code
-        let visCode = 0;
-        for (let i = 1; i < 9; i++) {
-            visCode |= (visBitFreqs[i] < 1250 ? 1 : 0) << (i - 1);
+        // Validate start bit (bit 0) and stop bit (bit 9) - should be ~1200 Hz
+        const startBitTolerance = 100;
+        if (Math.abs(visBitFreqs[0] - 1200) > startBitTolerance ||
+            Math.abs(visBitFreqs[9] - 1200) > startBitTolerance) {
+            return null;
         }
-        visCode &= 127;
+
+        // Validate data bits - should be either ~1100 Hz (1) or ~1300 Hz (0)
+        const dataBitTolerance = 100;
+        for (let i = 1; i <= 8; i++) {
+            const freq = visBitFreqs[i];
+            if (Math.abs(freq - 1100) > dataBitTolerance && Math.abs(freq - 1300) > dataBitTolerance) {
+                return null;
+            }
+        }
+
+        // Decode VIS code with parity validation
+        let visCode = 0;
+        let parity = false;
+        for (let i = 1; i <= 7; i++) {
+            const bit = visBitFreqs[i] < 1250 ? 1 : 0;
+            visCode |= bit << (i - 1);
+            if (bit) parity = !parity;
+        }
+
+        // Bit 8 is parity bit (even parity)
+        const parityBit = visBitFreqs[8] < 1250 ? 1 : 0;
+        if (parityBit) parity = !parity;
+
+        // Parity should be even (false)
+        if (parity) {
+            return null;
+        }
 
         return getModeByVIS(visCode);
     }
@@ -375,16 +429,26 @@ export class ImageChannelBuffer {
     private channels: Uint8Array[] = [];
     private mode: SSTVMode | null = null;
     public linesDecoded: number = 0;
+    private allocatedHeight: number = 0;  // Actual buffer capacity
 
     /**
-     * Allocate channels for a mode
+     * Allocate channels for a mode with extra capacity for non-standard transmissions
      */
     allocate(mode: SSTVMode): void {
         this.mode = mode;
+        // Allocate extra capacity (128 lines) for encoders that send more than spec
+        this.allocatedHeight = mode.height + 128;
         this.channels = new Array(mode.channelCount).fill(null).map(() =>
-            new Uint8Array(mode.width * mode.height)
+            new Uint8Array(mode.width * this.allocatedHeight)
         );
         this.linesDecoded = 0;
+    }
+
+    /**
+     * Get the maximum number of lines that can be stored
+     */
+    getMaxLines(): number {
+        return this.allocatedHeight;
     }
 
     /**
@@ -406,6 +470,7 @@ export class ImageChannelBuffer {
      */
     setPixel(channel: number, line: number, pixel: number, value: number): void {
         if (!this.mode) return;
+        if (line >= this.allocatedHeight) return;  // Bounds check
         this.channels[channel][line * this.mode.width + pixel] = value;
     }
 
@@ -414,6 +479,7 @@ export class ImageChannelBuffer {
      */
     getPixel(channel: number, line: number, pixel: number): number {
         if (!this.mode) return 0;
+        if (line >= this.allocatedHeight) return 0;  // Bounds check
         return this.channels[channel][line * this.mode.width + pixel];
     }
 
@@ -616,6 +682,7 @@ export class LinePixelDecoder {
 
     /**
      * Decode a full standard mode line (all channels)
+     * @param sampleOffset Optional sample offset for slant correction (in samples)
      */
     decodeStandardLine(
         sampleBuffer: Float32Array,
@@ -623,13 +690,16 @@ export class LinePixelDecoder {
         mode: SSTVMode,
         line: number,
         syncPulseIndex: number,
-        imageChannels: Uint8Array[]
+        imageChannels: Uint8Array[],
+        sampleOffset: number = 0
     ): void {
         const width = mode.width;
+        // Apply slant correction offset
+        const correctedSyncIndex = syncPulseIndex + Math.round(sampleOffset);
 
         for (let ch = 0; ch < mode.channelCount; ch++) {
             const channelOffset = mode.getChannelOffset(line, ch);
-            const channelStart = syncPulseIndex + Math.floor(channelOffset * this.sampleRate);
+            const channelStart = correctedSyncIndex + Math.floor(channelOffset * this.sampleRate);
             const scanTime = mode.getScanTime(line, ch);
 
             const pixelTime = scanTime / width;
@@ -655,6 +725,7 @@ export class LinePixelDecoder {
 
     /**
      * Decode a PD mode line pair (2 lines per sync)
+     * @param sampleOffset Optional sample offset for slant correction (in samples)
      */
     decodePDLinePair(
         sampleBuffer: Float32Array,
@@ -662,14 +733,17 @@ export class LinePixelDecoder {
         mode: SSTVMode,
         evenLine: number,
         syncPulseIndex: number,
-        imageChannels: Uint8Array[]
+        imageChannels: Uint8Array[],
+        sampleOffset: number = 0
     ): void {
         const width = mode.width;
         const oddLine = evenLine + 1;
+        // Apply slant correction offset
+        const correctedSyncIndex = syncPulseIndex + Math.round(sampleOffset);
 
         for (let ch = 0; ch < 4; ch++) {
             const channelOffset = mode.getChannelOffset(evenLine, ch);
-            const channelStart = syncPulseIndex + Math.floor(channelOffset * this.sampleRate);
+            const channelStart = correctedSyncIndex + Math.floor(channelOffset * this.sampleRate);
             const scanTime = mode.getScanTime(evenLine, ch);
 
             const pixelTime = scanTime / width;
